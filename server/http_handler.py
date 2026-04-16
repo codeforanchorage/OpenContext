@@ -50,6 +50,12 @@ _plugin_manager: Optional[PluginManager] = None
 _mcp_server: Optional[MCPServer] = None
 _config: Optional[Dict[str, Any]] = None
 
+# Reject JSON-RPC request bodies larger than this before parsing. The MCP
+# surface is small — every legitimate tool call fits well under a few KB —
+# so this is a cheap DoS guard against attackers flooding the Lambda with
+# megabyte-sized payloads.
+MAX_BODY_SIZE = 65536
+
 
 def _load_config() -> Dict[str, Any]:
     """Load configuration from environment or embedded config.
@@ -225,6 +231,39 @@ class UniversalHTTPHandler:
                 error_headers,
                 error_body,
             )
+
+        # Body size cap — reject oversized payloads before JSON parse.
+        body_bytes = (
+            len(body.encode("utf-8")) if isinstance(body, str) else len(body or b"")
+        )
+        if body_bytes > MAX_BODY_SIZE:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            error_body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Payload too large",
+                        "data": (
+                            f"Request body {body_bytes} bytes exceeds "
+                            f"{MAX_BODY_SIZE} byte limit"
+                        ),
+                    },
+                }
+            )
+            logger.warning(
+                f"413 error: body {body_bytes} bytes exceeds {MAX_BODY_SIZE}",
+                extra={
+                    "request_id": request_id,
+                    "request_path": path,
+                    "http_method": method,
+                    "duration_ms": duration_ms,
+                },
+            )
+            error_headers = {"Content-Type": "application/json"}
+            error_headers.update(self._get_cors_headers())
+            return (413, error_headers, error_body)
 
         # Parse JSON to check if this is an initialize request
         # NOTE: This is intentionally parsing the JSON body separately from the

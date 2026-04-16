@@ -16,7 +16,7 @@ from tenacity import (
 
 from core.interfaces import DataPlugin, PluginType, ToolDefinition, ToolResult
 from plugins.ckan.config_schema import CKANPluginConfig
-from plugins.ckan.sql_validator import SQLValidator
+from plugins.ckan.sql_validator import SafeSQLBuilder, SQLValidator
 
 logger = logging.getLogger(__name__)
 
@@ -491,12 +491,9 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         Returns:
             List of data records
         """
-        params = {"resource_id": resource_id, "limit": limit}
-
-        # Convert filters to CKAN filter format
+        params: Dict[str, Any] = {"resource_id": resource_id, "limit": limit}
         if filters:
-            for field, value in filters.items():
-                params[f"filters[{field}]"] = value
+            params["filters"] = filters
 
         response = await self._call_ckan_api("datastore_search", params)
         return response.get("result", {}).get("records", [])
@@ -530,6 +527,9 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         if not is_valid:
             return {"error": True, "message": error}
 
+        # Bound upstream scan cost: append LIMIT if the caller didn't set one.
+        sql = SQLValidator.enforce_row_limit(sql)
+
         # Log SQL execution (truncated for security)
         logger.info("Executing SQL", extra={"sql": sql[:500]})
 
@@ -562,56 +562,69 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
     ) -> Dict[str, Any]:
         """Aggregate data with GROUP BY.
 
-        Args:
-            resource_id: Resource ID (must be valid UUID)
-            group_by: List of fields to group by
-            metrics: Dictionary of metric_name: sql_expression (e.g., {"count": "count(*)"})
-            filters: Optional WHERE clause filters (field: value pairs)
-            having: Optional HAVING clause filters (expression: value pairs)
-            order_by: Optional field to order by
-            limit: Maximum number of results
-
-        Returns:
-            Dictionary with success flag, records, fields, or error message
+        Every identifier, metric expression, filter value, and LIMIT is
+        validated against a strict allowlist via ``SafeSQLBuilder`` before
+        the SQL is assembled, so caller-supplied strings cannot escape into
+        the generated query.
         """
-        # SELECT
-        select_fields = ", ".join(group_by) if group_by else ""
-        select_metrics = ", ".join(
-            [f"{expr} as {name}" for name, expr in metrics.items()]
+        try:
+            resource_id = SafeSQLBuilder.validate_resource_id(resource_id)
+            if not metrics:
+                raise ValueError("metrics must be non-empty")
+
+            group_by_quoted = [
+                SafeSQLBuilder.quote_identifier(f) for f in (group_by or [])
+            ]
+
+            metric_parts: List[str] = []
+            for alias, expr in metrics.items():
+                alias_quoted = SafeSQLBuilder.quote_identifier(alias)
+                expr_quoted = SafeSQLBuilder.validate_metric_expr(expr)
+                metric_parts.append(f"{expr_quoted} AS {alias_quoted}")
+
+            select_clause = ", ".join(group_by_quoted + metric_parts)
+
+            where_clause = ""
+            if filters:
+                conditions = [
+                    SafeSQLBuilder.build_filter_condition(f, v)
+                    for f, v in filters.items()
+                ]
+                where_clause = " WHERE " + " AND ".join(conditions)
+
+            group_clause = ""
+            if group_by_quoted:
+                group_clause = " GROUP BY " + ", ".join(group_by_quoted)
+
+            having_clause = ""
+            if having:
+                having_parts: List[str] = []
+                for expr, value in having.items():
+                    expr_quoted = SafeSQLBuilder.validate_metric_expr(expr)
+                    if isinstance(value, bool) or not isinstance(
+                        value, (int, float)
+                    ):
+                        raise ValueError(
+                            f"HAVING value must be numeric: {value!r}"
+                        )
+                    having_parts.append(f"{expr_quoted} > {value}")
+                having_clause = " HAVING " + " AND ".join(having_parts)
+
+            order_clause = ""
+            if order_by:
+                order_clause = " ORDER BY " + SafeSQLBuilder.validate_order_by(
+                    order_by
+                )
+
+            limit_int = SafeSQLBuilder.clamp_limit(limit)
+        except ValueError as e:
+            return {"error": True, "message": str(e)}
+
+        sql = (
+            f'SELECT {select_clause} FROM "{resource_id}"'
+            f"{where_clause}{group_clause}{having_clause}{order_clause}"
+            f" LIMIT {limit_int}"
         )
-        select_clause = (
-            f"{select_fields}, {select_metrics}" if select_fields else select_metrics
-        )
-
-        # WHERE
-        where_clause = ""
-        if filters:
-            conditions = []
-            for field, value in filters.items():
-                if isinstance(value, str):
-                    # Escape single quotes in SQL strings
-                    escaped_value = value.replace("'", "''")
-                    conditions.append(f"{field} = '{escaped_value}'")
-                elif value is None:
-                    conditions.append(f"{field} IS NULL")
-                else:
-                    conditions.append(f"{field} = {value}")
-            where_clause = "WHERE " + " AND ".join(conditions)
-
-        # GROUP BY
-        group_clause = f"GROUP BY {', '.join(group_by)}" if group_by else ""
-
-        # HAVING
-        having_clause = ""
-        if having:
-            conditions = [f"{expr} > {value}" for expr, value in having.items()]
-            having_clause = "HAVING " + " AND ".join(conditions)
-
-        # ORDER BY
-        order_clause = f"ORDER BY {order_by}" if order_by else ""
-
-        # Build SQL
-        sql = f'SELECT {select_clause} FROM "{resource_id}" {where_clause} {group_clause} {having_clause} {order_clause} LIMIT {limit}'.strip()
 
         return await self.execute_sql(sql)
 

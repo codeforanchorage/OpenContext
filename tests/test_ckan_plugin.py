@@ -403,8 +403,7 @@ class TestQueryData:
             params = call_args[1]["json"]
             assert params["resource_id"] == "resource-123"
             assert params["limit"] == 50
-            assert params["filters[status]"] == "Open"
-            assert params["filters[category]"] == "311"
+            assert params["filters"] == {"status": "Open", "category": "311"}
 
 
 class TestExecuteTool:
@@ -496,7 +495,7 @@ class TestExecuteTool:
             result = await plugin.execute_tool(
                 "execute_sql",
                 {
-                    "sql": 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" LIMIT 1'
+                    "sql": 'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'
                 },
             )
 
@@ -599,7 +598,12 @@ class TestExecuteTool:
             mock_response_sql = Mock()
             mock_response_sql.json.return_value = {
                 "success": False,
-                "error": {"message": 'relation "fake-uuid" does not exist'},
+                "error": {
+                    "message": (
+                        'relation "11111111-2222-3333-4444-555555555555" '
+                        "does not exist"
+                    )
+                },
             }
             mock_response_sql.raise_for_status = Mock()
             mock_client.post = AsyncMock(
@@ -610,7 +614,12 @@ class TestExecuteTool:
             await plugin.initialize()
             result = await plugin.execute_tool(
                 "execute_sql",
-                {"sql": 'SELECT * FROM "fake-uuid" LIMIT 1'},
+                {
+                    "sql": (
+                        'SELECT * FROM '
+                        '"11111111-2222-3333-4444-555555555555" LIMIT 1'
+                    )
+                },
             )
 
             assert result.success is False
@@ -647,7 +656,7 @@ class TestExecuteTool:
             result = await plugin.execute_tool(
                 "aggregate_data",
                 {
-                    "resource_id": "bad-resource-id",
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
                     "metrics": {"count": "count(*)"},
                 },
             )

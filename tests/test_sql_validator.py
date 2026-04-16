@@ -4,7 +4,9 @@ These tests verify that SQL validation correctly prevents SQL injection
 and destructive operations while allowing valid SELECT queries.
 """
 
-from plugins.ckan.sql_validator import SQLValidator
+import pytest
+
+from plugins.ckan.sql_validator import SafeSQLBuilder, SQLValidator
 
 
 class TestValidSelectQueries:
@@ -12,14 +14,14 @@ class TestValidSelectQueries:
 
     def test_simple_select_passes(self):
         """Test that simple SELECT query passes."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_where_clause_passes(self):
         """Test that SELECT with WHERE clause passes."""
-        sql = "SELECT * FROM \"abc-123-def-456-ghi-789-012-345-678-901\" WHERE status = 'Open'"
+        sql = "SELECT * FROM \"11111111-2222-3333-4444-555555555555\" WHERE status = 'Open'"
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
@@ -27,7 +29,7 @@ class TestValidSelectQueries:
     def test_select_with_order_by_passes(self):
         """Test that SELECT with ORDER BY passes."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" ORDER BY date DESC'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" ORDER BY date DESC'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
@@ -35,35 +37,35 @@ class TestValidSelectQueries:
 
     def test_select_with_limit_passes(self):
         """Test that SELECT with LIMIT passes."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" LIMIT 10'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 10'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_specific_columns_passes(self):
         """Test that SELECT with specific columns passes."""
-        sql = 'SELECT id, name, status FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT id, name, status FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_count_passes(self):
         """Test that SELECT with COUNT passes."""
-        sql = 'SELECT COUNT(*) FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT COUNT(*) FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_group_by_passes(self):
         """Test that SELECT with GROUP BY passes."""
-        sql = 'SELECT status, COUNT(*) FROM "abc-123-def-456-ghi-789-012-345-678-901" GROUP BY status'
+        sql = 'SELECT status, COUNT(*) FROM "11111111-2222-3333-4444-555555555555" GROUP BY status'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_join_passes(self):
         """Test that SELECT with JOIN passes."""
-        sql = 'SELECT a.* FROM "abc-123-def-456-ghi-789-012-345-678-901" a JOIN "def-456-ghi-789-012-345-678-901-234" b ON a.id = b.id'
+        sql = 'SELECT a.* FROM "11111111-2222-3333-4444-555555555555" a JOIN "66666666-7777-8888-9999-aaaaaaaaaaaa" b ON a.id = b.id'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
@@ -72,7 +74,7 @@ class TestValidSelectQueries:
         """Test that SELECT with CTE passes."""
         sql = """
         WITH subquery AS (
-            SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901"
+            SELECT * FROM "11111111-2222-3333-4444-555555555555"
         )
         SELECT * FROM subquery
         """
@@ -82,7 +84,7 @@ class TestValidSelectQueries:
 
     def test_select_with_window_function_passes(self):
         """Test that SELECT with window functions passes."""
-        sql = 'SELECT *, RANK() OVER (PARTITION BY status ORDER BY date) FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT *, RANK() OVER (PARTITION BY status ORDER BY date) FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
@@ -96,7 +98,7 @@ class TestValidSelectQueries:
 
     def test_select_case_insensitive_passes(self):
         """Test that SELECT in lowercase passes."""
-        sql = 'select * from "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'select * from "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
@@ -108,7 +110,7 @@ class TestRejectDestructiveOperations:
     def test_insert_statement_rejected(self):
         """Test that INSERT statements are rejected."""
         sql = (
-            "INSERT INTO \"abc-123-def-456-ghi-789-012-345-678-901\" VALUES (1, 'test')"
+            "INSERT INTO \"11111111-2222-3333-4444-555555555555\" VALUES (1, 'test')"
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -117,7 +119,7 @@ class TestRejectDestructiveOperations:
 
     def test_update_statement_rejected(self):
         """Test that UPDATE statements are rejected."""
-        sql = "UPDATE \"abc-123-def-456-ghi-789-012-345-678-901\" SET status = 'Closed'"
+        sql = "UPDATE \"11111111-2222-3333-4444-555555555555\" SET status = 'Closed'"
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -125,7 +127,7 @@ class TestRejectDestructiveOperations:
 
     def test_delete_statement_rejected(self):
         """Test that DELETE statements are rejected."""
-        sql = 'DELETE FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE id = 1'
+        sql = 'DELETE FROM "11111111-2222-3333-4444-555555555555" WHERE id = 1'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -133,7 +135,7 @@ class TestRejectDestructiveOperations:
 
     def test_drop_statement_rejected(self):
         """Test that DROP statements are rejected."""
-        sql = 'DROP TABLE "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'DROP TABLE "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -150,7 +152,7 @@ class TestRejectDestructiveOperations:
     def test_alter_statement_rejected(self):
         """Test that ALTER statements are rejected."""
         sql = (
-            'ALTER TABLE "abc-123-def-456-ghi-789-012-345-678-901" ADD COLUMN test INT'
+            'ALTER TABLE "11111111-2222-3333-4444-555555555555" ADD COLUMN test INT'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -159,7 +161,7 @@ class TestRejectDestructiveOperations:
 
     def test_truncate_statement_rejected(self):
         """Test that TRUNCATE statements are rejected."""
-        sql = 'TRUNCATE TABLE "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'TRUNCATE TABLE "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -167,7 +169,7 @@ class TestRejectDestructiveOperations:
 
     def test_grant_statement_rejected(self):
         """Test that GRANT statements are rejected."""
-        sql = 'GRANT SELECT ON "abc-123-def-456-ghi-789-012-345-678-901" TO user'
+        sql = 'GRANT SELECT ON "11111111-2222-3333-4444-555555555555" TO user'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -175,7 +177,7 @@ class TestRejectDestructiveOperations:
 
     def test_revoke_statement_rejected(self):
         """Test that REVOKE statements are rejected."""
-        sql = 'REVOKE SELECT ON "abc-123-def-456-ghi-789-012-345-678-901" FROM user'
+        sql = 'REVOKE SELECT ON "11111111-2222-3333-4444-555555555555" FROM user'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -188,7 +190,7 @@ class TestRejectSQLInjection:
     def test_multiple_statements_rejected(self):
         """Test that multiple statements are rejected."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901"; DROP TABLE users;'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555"; DROP TABLE users;'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -197,7 +199,7 @@ class TestRejectSQLInjection:
 
     def test_multiple_select_statements_rejected(self):
         """Test that multiple SELECT statements are rejected."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901"; SELECT * FROM "def-456-ghi-789-012-345-678-901-234"'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555"; SELECT * FROM "66666666-7777-8888-9999-aaaaaaaaaaaa"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -205,7 +207,7 @@ class TestRejectSQLInjection:
 
     def test_dangerous_comment_rejected(self):
         """Test that dangerous comments are rejected."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" -- DROP TABLE users'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" -- DROP TABLE users'
         is_valid, error = SQLValidator.validate_query(sql)
         # This might pass if comment handling is lenient, but should ideally fail
         # The validator should catch DROP in comments
@@ -214,7 +216,7 @@ class TestRejectSQLInjection:
 
     def test_command_execution_pattern_rejected(self):
         """Test that command execution patterns are rejected."""
-        sql = "SELECT * FROM \"abc-123-def-456-ghi-789-012-345-678-901\" WHERE xp_cmdshell('dir')"
+        sql = "SELECT * FROM \"11111111-2222-3333-4444-555555555555\" WHERE xp_cmdshell('dir')"
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -222,7 +224,7 @@ class TestRejectSQLInjection:
 
     def test_file_write_pattern_rejected(self):
         """Test that file write patterns are rejected."""
-        sql = 'SELECT * INTO OUTFILE "/tmp/test" FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT * INTO OUTFILE "/tmp/test" FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -231,7 +233,7 @@ class TestRejectSQLInjection:
     def test_sleep_function_rejected(self):
         """Test that sleep functions are rejected."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE pg_sleep(10)'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE pg_sleep(10)'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -241,7 +243,7 @@ class TestRejectSQLInjection:
     def test_union_based_injection_detected(self):
         """Test that UNION-based injection attempts are detected."""
         # This should fail because it's not a valid SELECT structure
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" UNION SELECT * FROM users'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" UNION SELECT * FROM users'
         is_valid, error = SQLValidator.validate_query(sql)
         # UNION might be valid in some contexts, but should be checked
         # The validator should parse and validate the structure
@@ -278,7 +280,7 @@ class TestRejectInvalidInputs:
     def test_too_long_query_rejected(self):
         """Test that queries exceeding max length are rejected."""
         # Create a query that exceeds MAX_SQL_LENGTH
-        base_query = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE '
+        base_query = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE '
         padding = "x" * (SQLValidator.MAX_SQL_LENGTH + 100)
         sql = base_query + padding
         is_valid, error = SQLValidator.validate_query(sql)
@@ -317,7 +319,7 @@ class TestRejectInvalidUUIDs:
 
     def test_uuid_without_quotes_passes_if_no_uuid_check(self):
         """Test that UUID without quotes might pass (depends on validator)."""
-        sql = "SELECT * FROM abc-123-def-456-ghi-789-012-345-678-901"
+        sql = "SELECT * FROM 11111111-2222-3333-4444-555555555555"
         is_valid, error = SQLValidator.validate_query(sql)
         # Without quotes, UUID pattern won't match, so won't be validated
         # But should still pass SELECT validation
@@ -330,7 +332,7 @@ class TestRejectForbiddenKeywords:
     def test_execute_keyword_rejected(self):
         """Test that EXECUTE keyword is rejected."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE EXECUTE test'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE EXECUTE test'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -339,7 +341,7 @@ class TestRejectForbiddenKeywords:
 
     def test_exec_keyword_rejected(self):
         """Test that EXEC keyword is rejected."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE EXEC test'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE EXEC test'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -347,7 +349,7 @@ class TestRejectForbiddenKeywords:
 
     def test_call_keyword_rejected(self):
         """Test that CALL keyword is rejected."""
-        sql = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE CALL test'
+        sql = 'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE CALL test'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
         assert error is not None
@@ -356,7 +358,7 @@ class TestRejectForbiddenKeywords:
     def test_declare_keyword_rejected(self):
         """Test that DECLARE keyword is rejected."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE DECLARE @var'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE DECLARE @var'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is False
@@ -366,7 +368,7 @@ class TestRejectForbiddenKeywords:
     def test_set_keyword_in_where_might_pass(self):
         """Test that SET keyword in WHERE clause might pass (context-dependent)."""
         sql = (
-            'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901" WHERE status = SET'
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" WHERE status = SET'
         )
         is_valid, error = SQLValidator.validate_query(sql)
         # SET as a value might pass, but SET as keyword should be caught
@@ -379,28 +381,28 @@ class TestEdgeCases:
 
     def test_select_with_nested_subquery_passes(self):
         """Test that SELECT with nested subquery passes."""
-        sql = 'SELECT * FROM (SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901") sub'
+        sql = 'SELECT * FROM (SELECT * FROM "11111111-2222-3333-4444-555555555555") sub'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_having_clause_passes(self):
         """Test that SELECT with HAVING clause passes."""
-        sql = 'SELECT status, COUNT(*) FROM "abc-123-def-456-ghi-789-012-345-678-901" GROUP BY status HAVING COUNT(*) > 10'
+        sql = 'SELECT status, COUNT(*) FROM "11111111-2222-3333-4444-555555555555" GROUP BY status HAVING COUNT(*) > 10'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_distinct_passes(self):
         """Test that SELECT DISTINCT passes."""
-        sql = 'SELECT DISTINCT status FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT DISTINCT status FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_aggregate_functions_passes(self):
         """Test that SELECT with aggregate functions passes."""
-        sql = 'SELECT AVG(value), MAX(value), MIN(value) FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        sql = 'SELECT AVG(value), MAX(value), MIN(value) FROM "11111111-2222-3333-4444-555555555555"'
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
@@ -408,7 +410,7 @@ class TestEdgeCases:
     def test_select_exactly_max_length_passes(self):
         """Test that query exactly at max length passes."""
         # Create query exactly at MAX_SQL_LENGTH
-        base_query = 'SELECT * FROM "abc-123-def-456-ghi-789-012-345-678-901"'
+        base_query = 'SELECT * FROM "11111111-2222-3333-4444-555555555555"'
         padding_length = SQLValidator.MAX_SQL_LENGTH - len(base_query)
         if padding_length > 0:
             sql = base_query + " " + "x" * (padding_length - 1)
@@ -418,14 +420,339 @@ class TestEdgeCases:
 
     def test_select_with_special_characters_passes(self):
         """Test that SELECT with special characters passes."""
-        sql = "SELECT * FROM \"abc-123-def-456-ghi-789-012-345-678-901\" WHERE name = 'O'Brien'"
+        sql = "SELECT * FROM \"11111111-2222-3333-4444-555555555555\" WHERE name = 'O'Brien'"
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
 
     def test_select_with_regex_patterns_passes(self):
         """Test that SELECT with regex patterns passes."""
-        sql = "SELECT * FROM \"abc-123-def-456-ghi-789-012-345-678-901\" WHERE name ~ '^[A-Z]'"
+        sql = "SELECT * FROM \"11111111-2222-3333-4444-555555555555\" WHERE name ~ '^[A-Z]'"
         is_valid, error = SQLValidator.validate_query(sql)
         assert is_valid is True
         assert error is None
+
+
+class TestFromJoinTargetEnforcement:
+    """FROM/JOIN targets must be UUID-quoted resources or CTE aliases."""
+
+    def test_schema_qualified_target_rejected(self):
+        sql = "SELECT * FROM pg_catalog.pg_user"
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "Schema-qualified" in error
+
+    def test_information_schema_rejected(self):
+        sql = "SELECT * FROM information_schema.columns"
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "Schema-qualified" in error
+
+    def test_union_to_unknown_table_rejected(self):
+        sql = (
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
+            "UNION SELECT * FROM users"
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "users" in error
+
+    def test_quoted_non_uuid_rejected(self):
+        sql = 'SELECT * FROM "not-a-uuid-at-all-really"'
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "UUID" in error or "Invalid" in error
+
+    def test_cte_alias_accepted(self):
+        sql = (
+            'WITH sub AS (SELECT * FROM "11111111-2222-3333-4444-555555555555") '
+            "SELECT * FROM sub"
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is True, error
+
+    def test_subquery_with_alias_accepted(self):
+        sql = (
+            'SELECT * FROM (SELECT * FROM "11111111-2222-3333-4444-555555555555")'
+            " sub"
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is True, error
+
+    def test_join_with_one_unknown_target_rejected(self):
+        sql = (
+            'SELECT * FROM "11111111-2222-3333-4444-555555555555" a '
+            'JOIN "pg_user" b ON a.id = b.id'
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+
+    def test_bare_select_without_from_rejected(self):
+        sql = "SELECT 1"
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "FROM" in error
+
+
+class TestCommentStrippingBeforeKeywordScan:
+    """Forbidden keywords hidden in comments must not slip past the scanner."""
+
+    def test_block_comment_hiding_select_prefix_rejected(self):
+        sql = '/*SELECT*/ DELETE FROM "11111111-2222-3333-4444-555555555555"'
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "DELETE" in error
+
+    def test_line_comment_hiding_delete_rejected(self):
+        sql = (
+            '-- comment\nDELETE FROM "11111111-2222-3333-4444-555555555555"'
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert "DELETE" in error
+
+    def test_benign_block_comment_accepted(self):
+        sql = 'SELECT * /* hello */ FROM "11111111-2222-3333-4444-555555555555"'
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is True, error
+
+
+class TestForbiddenFunctions:
+    """Postgres functions useful for data exfiltration are blocked by name."""
+
+    @pytest.mark.parametrize(
+        "fn",
+        [
+            "pg_read_file",
+            "pg_ls_dir",
+            "pg_stat_file",
+            "lo_import",
+            "lo_export",
+            "current_setting",
+            "set_config",
+            "dblink",
+        ],
+    )
+    def test_forbidden_function_rejected(self, fn):
+        sql = (
+            f"SELECT {fn}('x') FROM "
+            '"11111111-2222-3333-4444-555555555555"'
+        )
+        is_valid, error = SQLValidator.validate_query(sql)
+        assert is_valid is False
+        assert fn in error
+
+
+class TestSafeSQLBuilderIdentifier:
+    def test_valid_identifier_quoted(self):
+        assert SafeSQLBuilder.quote_identifier("neighborhood") == '"neighborhood"'
+
+    def test_underscore_and_digits(self):
+        assert SafeSQLBuilder.quote_identifier("col_1") == '"col_1"'
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "col; DROP TABLE x",
+            "col)",
+            "1col",
+            "col space",
+            "col.other",
+            "col--",
+            "",
+            None,
+            42,
+        ],
+    )
+    def test_bad_identifier_rejected(self, bad):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.quote_identifier(bad)
+
+
+class TestSafeSQLBuilderMetric:
+    def test_count_star(self):
+        assert SafeSQLBuilder.validate_metric_expr("count(*)") == "count(*)"
+
+    def test_count_star_whitespace(self):
+        assert (
+            SafeSQLBuilder.validate_metric_expr("  COUNT ( * ) ")
+            == "count(*)"
+        )
+
+    @pytest.mark.parametrize(
+        "expr,expected",
+        [
+            ("sum(amount)", 'sum("amount")'),
+            ("avg(value)", 'avg("value")'),
+            ("min(x)", 'min("x")'),
+            ("max(x)", 'max("x")'),
+            ("stddev(y)", 'stddev("y")'),
+            ("count(distinct user_id)", 'count(DISTINCT "user_id")'),
+        ],
+    )
+    def test_aggregate_quotes_identifier(self, expr, expected):
+        assert SafeSQLBuilder.validate_metric_expr(expr) == expected
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "pg_sleep(10)",
+            "count(*)); DROP TABLE x--",
+            "sum(x + y)",
+            "sum(x); select 1",
+            "count(*) + 1",
+            "concat(a, b)",
+            "sum(x.y)",
+            "",
+            None,
+        ],
+    )
+    def test_bad_metric_rejected(self, bad):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.validate_metric_expr(bad)
+
+
+class TestSafeSQLBuilderFilter:
+    def test_integer_value(self):
+        assert SafeSQLBuilder.build_filter_condition("id", 42) == '"id" = 42'
+
+    def test_float_value(self):
+        assert (
+            SafeSQLBuilder.build_filter_condition("lat", 42.5)
+            == '"lat" = 42.5'
+        )
+
+    def test_none_value(self):
+        assert (
+            SafeSQLBuilder.build_filter_condition("status", None)
+            == '"status" IS NULL'
+        )
+
+    def test_bool_true(self):
+        assert (
+            SafeSQLBuilder.build_filter_condition("active", True)
+            == '"active" = TRUE'
+        )
+
+    def test_string_value_escaped(self):
+        assert (
+            SafeSQLBuilder.build_filter_condition("name", "O'Brien")
+            == "\"name\" = 'O''Brien'"
+        )
+
+    def test_string_injection_escaped_not_executed(self):
+        got = SafeSQLBuilder.build_filter_condition("name", "x' OR 1=1--")
+        assert got == "\"name\" = 'x'' OR 1=1--'"
+
+    def test_bad_field_rejected(self):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.build_filter_condition("name; DROP TABLE x", "ok")
+
+    def test_unsupported_value_type_rejected(self):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.build_filter_condition("name", ["list"])
+
+
+class TestSafeSQLBuilderOrderAndLimit:
+    def test_order_by_plain(self):
+        assert SafeSQLBuilder.validate_order_by("date") == '"date"'
+
+    def test_order_by_desc(self):
+        assert SafeSQLBuilder.validate_order_by("date DESC") == '"date" DESC'
+
+    def test_order_by_asc_lower(self):
+        assert SafeSQLBuilder.validate_order_by("date asc") == '"date" ASC'
+
+    @pytest.mark.parametrize(
+        "bad", ["date; DROP", "date, other", "1", "a.b", "", None]
+    )
+    def test_bad_order_by_rejected(self, bad):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.validate_order_by(bad)
+
+    def test_limit_clamped_to_max(self):
+        assert SafeSQLBuilder.clamp_limit(10**9) == SafeSQLBuilder.MAX_LIMIT
+
+    def test_limit_passthrough(self):
+        assert SafeSQLBuilder.clamp_limit(50) == 50
+
+    @pytest.mark.parametrize("bad", [0, -1, "10", None, True, 1.5])
+    def test_bad_limit_rejected(self, bad):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.clamp_limit(bad)
+
+
+class TestSafeSQLBuilderResourceId:
+    def test_valid_uuid(self):
+        uuid = "11111111-2222-3333-4444-555555555555"
+        assert SafeSQLBuilder.validate_resource_id(uuid) == uuid
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "pg_catalog.pg_user",
+            "not-a-uuid",
+            "11111111-2222-3333-4444-55555555555",  # too short
+            "",
+            None,
+            123,
+        ],
+    )
+    def test_bad_resource_id_rejected(self, bad):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.validate_resource_id(bad)
+
+
+class TestEnforceRowLimit:
+    """``SQLValidator.enforce_row_limit`` appends a LIMIT if absent."""
+
+    UUID = "11111111-2222-3333-4444-555555555555"
+
+    def test_appends_limit_when_missing(self):
+        sql = f'SELECT * FROM "{self.UUID}"'
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out.endswith(f"LIMIT {SQLValidator.DEFAULT_ROW_LIMIT}")
+
+    def test_preserves_existing_top_level_limit(self):
+        sql = f'SELECT * FROM "{self.UUID}" LIMIT 5'
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out == sql
+
+    def test_preserves_limit_case_insensitive(self):
+        sql = f'SELECT * FROM "{self.UUID}" limit 5'
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out == sql
+
+    def test_subquery_limit_does_not_count_as_top_level(self):
+        sql = (
+            f'SELECT * FROM (SELECT * FROM "{self.UUID}" LIMIT 5) sub'
+        )
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out.endswith(f"LIMIT {SQLValidator.DEFAULT_ROW_LIMIT}")
+
+    def test_cte_without_top_level_limit_gets_limit_appended(self):
+        sql = (
+            f'WITH t AS (SELECT neighborhood FROM "{self.UUID}") '
+            "SELECT * FROM t"
+        )
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out.endswith(f"LIMIT {SQLValidator.DEFAULT_ROW_LIMIT}")
+
+    def test_cte_with_top_level_limit_preserved(self):
+        sql = (
+            f'WITH t AS (SELECT neighborhood FROM "{self.UUID}") '
+            "SELECT * FROM t LIMIT 3"
+        )
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out == sql
+
+    def test_trailing_semicolon_stripped_before_append(self):
+        sql = f'SELECT * FROM "{self.UUID}";'
+        out = SQLValidator.enforce_row_limit(sql)
+        assert ";" not in out.split("LIMIT")[0]
+        assert out.endswith(f"LIMIT {SQLValidator.DEFAULT_ROW_LIMIT}")
+
+    def test_trailing_whitespace_handled(self):
+        sql = f'SELECT * FROM "{self.UUID}"   \n  '
+        out = SQLValidator.enforce_row_limit(sql)
+        assert out.endswith(f"LIMIT {SQLValidator.DEFAULT_ROW_LIMIT}")

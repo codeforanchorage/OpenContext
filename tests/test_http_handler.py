@@ -9,7 +9,12 @@ import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from server.http_handler import UniversalHTTPHandler, _initialize_server, _load_config
+from server.http_handler import (
+    MAX_BODY_SIZE,
+    UniversalHTTPHandler,
+    _initialize_server,
+    _load_config,
+)
 from core.validators import ConfigurationError
 
 
@@ -555,3 +560,63 @@ class TestServerInitialization:
                 await _initialize_server()
 
             assert "Configuration error" in str(exc_info.value)
+
+
+class TestBodySizeCap:
+    """The handler rejects request bodies larger than ``MAX_BODY_SIZE``."""
+
+    @pytest.mark.asyncio
+    async def test_oversized_body_returns_413_without_parsing(self):
+        """A body one byte over the cap is rejected with 413 and never reaches the MCP server."""
+        handler = UniversalHTTPHandler()
+        oversized = "x" * (MAX_BODY_SIZE + 1)
+
+        with patch("server.http_handler._mcp_server") as mock_mcp_server:
+            mock_mcp_server.handle_http_request = AsyncMock()
+
+            status, headers, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=oversized,
+                headers={},
+            )
+
+            assert status == 413
+            mock_mcp_server.handle_http_request.assert_not_called()
+            payload = json.loads(body)
+            assert payload["error"]["message"] == "Payload too large"
+            assert str(MAX_BODY_SIZE) in payload["error"]["data"]
+            assert headers["Content-Type"] == "application/json"
+
+    @pytest.mark.asyncio
+    async def test_body_exactly_at_cap_is_accepted(self):
+        """A body exactly at the cap is accepted (only strictly over should 413)."""
+        handler = UniversalHTTPHandler()
+        # Build a request that serializes to exactly MAX_BODY_SIZE bytes.
+        base = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": ""}}
+        overhead = len(json.dumps(base))
+        base["params"]["pad"] = "x" * (MAX_BODY_SIZE - overhead)
+        body_str = json.dumps(base)
+        assert len(body_str.encode("utf-8")) == MAX_BODY_SIZE
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock(
+                return_value={
+                    "statusCode": 200,
+                    "headers": {},
+                    "body": json.dumps({"result": "ok"}),
+                }
+            )
+
+            status, _, _ = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=body_str,
+                headers={},
+            )
+
+            assert status == 200
+            mock_mcp_server.handle_http_request.assert_called_once()
