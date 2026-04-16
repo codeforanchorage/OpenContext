@@ -112,7 +112,16 @@ jobs:
           echo "Version: $VERSION"
 
       - name: Install Python dependencies into package directory
-        run: uv pip install --target ./package -r requirements.txt
+        # Pin --python-version and --python-platform so wheel resolution is
+        # independent of the runner's ambient interpreter and OS. Matches
+        # the uv path in scripts/deploy.sh and the python3.11 runtime pinned
+        # in terraform/aws/main.tf.
+        run: |
+          uv pip install -r requirements.txt \
+            --target ./package \
+            --python-platform x86_64-manylinux2014 \
+            --python-version 3.11 \
+            --no-compile
 
       - name: Copy application code into package
         run: |
@@ -122,9 +131,22 @@ jobs:
           cp examples/boston-opendata/config.yaml package/config.yaml
 
       - name: Create Lambda ZIP
+        # Use Python stdlib zipfile to match scripts/deploy.sh and
+        # .github/workflows/infra.yml — avoids depending on the `zip` binary.
         run: |
           cd package
-          zip -r ../opencontext-lambda-${{ steps.get_version.outputs.version }}.zip .
+          python - "../opencontext-lambda-${{ steps.get_version.outputs.version }}.zip" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          zip_path = sys.argv[1]
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+              for root, _, files in os.walk("."):
+                  for name in files:
+                      path = os.path.join(root, name)
+                      z.write(path, os.path.relpath(path, "."))
+          PY
 
       - name: Upload Lambda ZIP artifact
         uses: actions/upload-artifact@v4

@@ -28,6 +28,12 @@ variable "lambda_timeout" {
   default     = 120
 }
 
+variable "lambda_reserved_concurrency" {
+  description = "Maximum concurrent Lambda invocations. Caps how hard a single abusive client can fan out into the upstream open-data portal. Set to -1 to disable the limit (use AWS account-wide concurrency)."
+  type        = number
+  default     = 10
+}
+
 variable "api_quota_limit" {
   description = "API Gateway daily request quota"
   type        = number

@@ -86,9 +86,13 @@ if [ ! -f "config.yaml" ]; then
     exit 1
 fi
 
-# Check if Python is available
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}❌ Error: python3 not found${NC}"
+# Check if Python is available (python3 on Linux/macOS, python on Windows)
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+elif command -v python &> /dev/null; then
+    PYTHON=python
+else
+    echo -e "${RED}❌ Error: python not found${NC}"
     echo "Please install Python 3.11 or later."
     exit 1
 fi
@@ -103,7 +107,7 @@ fi
 echo -e "${YELLOW}📋 Step 1: Validating configuration...${NC}"
 
 # Count enabled plugins using Python for reliable YAML parsing
-ENABLED_COUNT=$(python3 << 'EOF'
+ENABLED_COUNT=$($PYTHON << 'EOF'
 import yaml
 import sys
 
@@ -153,7 +157,7 @@ if [ $EXIT_CODE -eq 1 ]; then
     echo "See docs/GETTING_STARTED.md for setup instructions."
     exit 1
 elif [ $EXIT_CODE -eq 2 ]; then
-    ENABLED_PLUGINS=$(python3 << 'EOF'
+    ENABLED_PLUGINS=$($PYTHON << 'EOF'
 import yaml
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -197,7 +201,7 @@ elif [ $EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
-ENABLED_PLUGIN=$(python3 << 'EOF'
+ENABLED_PLUGIN=$($PYTHON << 'EOF'
 import yaml
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -212,7 +216,7 @@ echo -e "${GREEN}✓ Configuration valid: ${ENABLED_PLUGIN} plugin enabled${NC}"
 echo ""
 
 # Extract server name and AWS settings
-SERVER_NAME=$(python3 << 'EOF'
+SERVER_NAME=$($PYTHON << 'EOF'
 import yaml
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -220,7 +224,7 @@ print(config.get('server_name', 'my-mcp-server'))
 EOF
 )
 
-AWS_REGION=$(python3 << 'EOF'
+AWS_REGION=$($PYTHON << 'EOF'
 import yaml
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -261,21 +265,42 @@ if command -v uv &> /dev/null; then
     fi
 else
     echo "uv not found, falling back to pip..."
-    if ! pip install -r requirements.txt -t "$PACKAGE_DIR/" --platform manylinux2014_x86_64 --only-binary :all: --no-compile --no-deps 2>/dev/null; then
-        echo "Platform-specific install failed, trying generic install..."
-        if ! pip install -r requirements.txt -t "$PACKAGE_DIR/" --no-compile 2>/dev/null; then
-            echo -e "${RED}❌ Error: Failed to install dependencies${NC}"
-            echo "Please ensure pip is available and requirements.txt is valid."
-            exit 1
-        fi
+    # Lambda runtime is pinned to python3.11 in terraform/aws/main.tf, so we
+    # must force pip to resolve cp311 wheels regardless of the host Python
+    # version. Without these flags pip picks wheels for the ambient interpreter
+    # (e.g. cp314 on a Python 3.14 build host), which then fail to import at
+    # Lambda cold start with a 502 InternalServerErrorException.
+    if ! pip install -r requirements.txt \
+        -t "$PACKAGE_DIR/" \
+        --platform manylinux2014_x86_64 \
+        --python-version 3.11 \
+        --implementation cp \
+        --abi cp311 \
+        --only-binary :all: \
+        --no-compile; then
+        echo -e "${RED}❌ Error: Failed to install dependencies for python3.11${NC}"
+        echo "Ensure pip >= 22 is available and every requirement has a cp311 manylinux wheel."
+        exit 1
     fi
 fi
 
-# Create zip file
+# Create zip file using Python's stdlib zipfile — matches the convention in
+# .github/workflows/infra.yml and avoids depending on the `zip` binary, which
+# isn't present in every build environment (notably the staging CI image).
 ZIP_FILE="lambda-deployment.zip"
-cd "$PACKAGE_DIR"
-zip -r "../$ZIP_FILE" . > /dev/null
-cd ..
+(cd "$PACKAGE_DIR" && "$PYTHON" - "../$ZIP_FILE" <<'PY'
+import os
+import sys
+import zipfile
+
+zip_path = sys.argv[1]
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk("."):
+        for name in files:
+            path = os.path.join(root, name)
+            z.write(path, os.path.relpath(path, "."))
+PY
+)
 
 echo -e "${GREEN}✓ Lambda package created: $ZIP_FILE${NC}"
 echo ""

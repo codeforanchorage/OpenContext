@@ -1,1 +1,28 @@
-examples/dc-arcgis/config.yaml
+---
+server_name: "Boston OpenData MCP"
+description: "City of Boston open data MCP server - Safe, conversational access to Boston's open data"
+organization: "City of Boston"
+
+plugins:
+  ckan:
+    enabled: true
+    base_url: "https://data.boston.gov/"
+    portal_url: "https://data.boston.gov/"
+    city_name: "Boston"
+    timeout: 120
+
+  arcgis:
+    enabled: false
+    portal_url: "https://data-boston.hub.arcgis.com"
+    city_name: "Boston"
+    timeout: 120
+
+aws:
+  region: "us-west-2"
+  lambda_name: "boston-ckan-mcp-staging"
+  lambda_memory: 512
+  lambda_timeout: 120
+
+logging:
+  level: "INFO"
+  format: "json"
