@@ -1,0 +1,18 @@
+# Copy this file to `backend.tf` and replace <AWS_ACCOUNT_ID> with your AWS
+# account ID. Terraform does not allow variable interpolation inside the
+# backend block (it's evaluated before variables are resolved), so the value
+# has to be hardcoded. `backend.tf` itself is gitignored — each fork ships
+# its own.
+#
+# Run `scripts/setup-backend.sh` first to create the S3 state bucket and
+# DynamoDB lock table, then `terraform init` against `terraform/aws/`.
+
+terraform {
+  backend "s3" {
+    bucket         = "boston-opencontext-tfstate-<AWS_ACCOUNT_ID>-us-west-2"
+    key            = "terraform.tfstate"
+    region         = "us-west-2"
+    dynamodb_table = "terraform-state-lock"
+    encrypt        = true
+  }
+}

@@ -217,6 +217,10 @@ terraform/*/lambda-deployment.zip
 **/*.tfstate
 **/*.tfstate.*
 
+# Terraform backend config — contains the deployer's AWS account ID in the
+# S3 bucket name. Each fork ships its own. See terraform/aws/backend.tf.example.
+terraform/aws/backend.tf
+
 # OpenContext client binaries
 opencontext-client
 opencontext-client-*

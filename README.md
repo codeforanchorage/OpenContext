@@ -45,6 +45,8 @@ See [Getting Started](docs/GETTING_STARTED.md) for full setup.
 | [Getting Started](docs/GETTING_STARTED.md) | Setup and usage                                 |
 | [Architecture](docs/ARCHITECTURE.md)       | System design and plugins                       |
 | [Deployment](docs/DEPLOYMENT.md)           | AWS, Terraform, monitoring                      |
+| [AWS Deployment (Boston)](docs/AWS_DEPLOYMENT.md) | Boston fork: region, concurrency, domain, packaging |
+| [Security](docs/SECURITY.md)               | SQL hardening, rate limits, upstream-portal protection |
 | [Testing](docs/TESTING.md)                 | Local testing (Terminal, Claude, MCP Inspector) |
 
 

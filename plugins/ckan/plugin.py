@@ -4,7 +4,7 @@ This plugin provides access to CKAN-based open data portals.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from tenacity import (
@@ -16,7 +16,7 @@ from tenacity import (
 
 from core.interfaces import DataPlugin, PluginType, ToolDefinition, ToolResult
 from plugins.ckan.config_schema import CKANPluginConfig
-from plugins.ckan.sql_validator import SQLValidator
+from plugins.ckan.sql_validator import SafeSQLBuilder, SQLValidator
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,25 @@ class CKANPlugin(DataPlugin):
             self.client = None
         self._initialized = False
         logger.info("CKAN plugin shut down")
+
+    @staticmethod
+    def _is_queryable(resource: Dict[str, Any]) -> bool:
+        """A CKAN resource is queryable via datastore_search only if it has
+        been loaded into CKAN's Postgres datastore. Boston attaches each
+        dataset as 5–7 download-only resources (GeoJSON, KML, SHP, ...) plus
+        a single CSV that's actually loaded; only that one returns rows."""
+        return bool(resource.get("datastore_active"))
+
+    @classmethod
+    def _first_queryable_resource(
+        cls, dataset: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the first resource of a dataset that is loaded into the
+        datastore (i.e. answers datastore_search), or None if none are."""
+        for res in dataset.get("resources") or []:
+            if cls._is_queryable(res):
+                return res
+        return None
 
     def _parse_ckan_error(
         self, response_body: Dict[str, Any], context: str = ""
@@ -155,20 +174,45 @@ class CKANPlugin(DataPlugin):
         Returns:
             List of tool definitions
         """
+        city = self.plugin_config.city_name
         return [
             ToolDefinition(
                 name="search_datasets",
-                description=f"Search for datasets in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Search for datasets in {city}'s open data portal by keyword.\n\n"
+                    "Returns a list of CKAN datasets. Each dataset contains a "
+                    "`resources` array; each resource has its own `id` (a UUID) "
+                    "that identifies a queryable table.\n\n"
+                    "Next step:\n"
+                    "  - EASIEST: if you just want data rows, call "
+                    "`ckan__search_and_query` with the same query — it combines "
+                    "search + query in one call.\n"
+                    "  - Otherwise: pick a resource from `resources[].id` in the "
+                    "response and call `ckan__query_data` with that value as "
+                    "`resource_id`.\n"
+                    "  - To inspect a dataset's resources first, call "
+                    "`ckan__get_dataset` with `dataset_id` set to the dataset's "
+                    "`id` or `name`.\n\n"
+                    "The formatted response surfaces a `suggested_resource_id` "
+                    "and `suggested_next_tool` line at the top — read those to "
+                    "pick the next call."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query string",
+                            "description": (
+                                "Free-text keywords matched against "
+                                "DATASET METADATA (title/tags/desc), NOT "
+                                "row content. Use the row-returning "
+                                "tools' `where` argument to filter ROWS. "
+                                "Examples: '311', 'parks'."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of results (default: 20)",
+                            "description": "Maximum number of datasets to return (default: 20).",
                             "default": 20,
                         },
                     },
@@ -177,13 +221,27 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="get_dataset",
-                description=f"Get detailed information about a specific dataset from {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Get full metadata for one dataset in {city}'s open data "
+                    "portal, including its `resources` array.\n\n"
+                    "Use this to find the resource UUIDs needed by "
+                    "`ckan__query_data`, `ckan__get_schema`, "
+                    "`ckan__aggregate_data`, or `ckan__execute_sql`. The "
+                    "response lists each resource with its `Resource ID` "
+                    "(a UUID).\n\n"
+                    "Next step: call `ckan__query_data` with `resource_id` set "
+                    "to one of the `Resource ID` values from this response."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "dataset_id": {
                             "type": "string",
-                            "description": "Dataset ID or name",
+                            "description": (
+                                "Dataset ID or slug. Provenance: the `id` "
+                                "(or `name`) field of a dataset returned by "
+                                "`ckan__search_datasets`. NOT a resource UUID."
+                            ),
                         },
                     },
                     "required": ["dataset_id"],
@@ -191,21 +249,89 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="query_data",
-                description=f"Query data from a specific resource in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Query rows from a specific resource in {city}'s open "
+                    "data portal.\n\n"
+                    "The `resource_id` parameter is a CKAN resource UUID — "
+                    "NOT a dataset ID. Get one by first calling "
+                    "`ckan__search_datasets` or `ckan__get_dataset` and "
+                    "reading the `id` inside the `resources` array.\n\n"
+                    "IMPORTANT: only resources with `datastore_active=true` "
+                    "are queryable here. Boston datasets typically attach "
+                    "5–7 resources (GeoJSON, KML, SHP, PDF, ArcGIS REST, "
+                    "CSV) but only the CSV one is loaded into the "
+                    "datastore. If you call this tool with a download-only "
+                    "resource UUID it will return 404. The output of "
+                    "`ckan__search_datasets` and `ckan__get_dataset` "
+                    "labels resources as QUERYABLE or DOWNLOAD-ONLY — pick "
+                    "the QUERYABLE one.\n\n"
+                    "FILTERING — pick the right knob:\n"
+                    "  - `filters` is EQUALITY ONLY (case_status='Closed'). "
+                    "Cannot do dates, ranges, BETWEEN, IN, LIKE, or any "
+                    "comparison. A timestamp column will NEVER match an "
+                    "equality filter on a date string like '2026-04-29'.\n"
+                    "  - `where` is structured comparison. Use this for "
+                    "date ranges, numeric bounds, IN-lists, LIKE/ILIKE, "
+                    "or NULL checks. Example for 'closed on 2026-04-29':\n"
+                    "    where = {\"close_date\": {\"gte\": "
+                    "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                    "\"case_status\": \"Closed\"}\n"
+                    "  - For window functions, CTEs, joins, or anything "
+                    "the structured `where` can't express, use "
+                    "`ckan__execute_sql` instead.\n\n"
+                    "Note: `query` arguments on search tools match dataset "
+                    "metadata (titles/tags), NOT row content. To filter "
+                    "ROWS by date/status/etc., use `where` here or in "
+                    "`ckan__search_and_query`.\n\n"
+                    "Tip: if you only have a keyword and no resource_id "
+                    "yet, use `ckan__search_and_query` instead — it does "
+                    "the lookup and the data fetch in a single call and "
+                    "auto-picks the datastore-loaded resource."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "resource_id": {
                             "type": "string",
-                            "description": "Resource ID to query",
+                            "description": (
+                                "CKAN resource UUID (36-char, e.g. "
+                                "'11111111-2222-3333-4444-555555555555'). "
+                                "Provenance: the `id` field inside the "
+                                "`resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`. This is NOT a dataset ID."
+                            ),
                         },
                         "filters": {
                             "type": "object",
-                            "description": "Optional filters (field: value pairs)",
+                            "description": (
+                                "EQUALITY-ONLY filters as field:value "
+                                "pairs (e.g. {\"status\": \"Open\"}). For "
+                                "ranges/dates/IN/LIKE, use `where` "
+                                "instead — `filters` cannot express "
+                                "anything other than exact equality."
+                            ),
+                        },
+                        "where": {
+                            "type": "object",
+                            "description": (
+                                "Structured WHERE clause supporting "
+                                "comparison operators. Each entry is "
+                                "either {field: scalar} (equality) or "
+                                "{field: {op: value, ...}} where op is "
+                                "one of: eq, ne, gt, gte, lt, lte, in, "
+                                "not_in, like, ilike, is_null. Example "
+                                "for 'closed on 2026-04-29': "
+                                "{\"close_date\": {\"gte\": "
+                                "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                                "\"case_status\": \"Closed\"}. The "
+                                "schema footer in any prior query result "
+                                "lists available column names and types."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of records (default: 100)",
+                            "description": "Maximum number of records (default: 100).",
                             "default": 100,
                         },
                     },
@@ -214,13 +340,28 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="get_schema",
-                description=f"Get schema information for a resource in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Get the schema (field names and types) for a resource "
+                    f"in {city}'s open data portal.\n\n"
+                    "Call this BEFORE `ckan__aggregate_data` or "
+                    "`ckan__execute_sql` so you know the exact field names "
+                    "to reference in `group_by`, `metrics`, SELECT, or WHERE "
+                    "clauses.\n\n"
+                    "Next step: pass the field names you discover to "
+                    "`ckan__aggregate_data` (in `group_by` / `metrics`) or "
+                    "to `ckan__execute_sql`."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "resource_id": {
                             "type": "string",
-                            "description": "Resource ID",
+                            "description": (
+                                "CKAN resource UUID. Provenance: the `id` "
+                                "inside the `resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`."
+                            ),
                         },
                     },
                     "required": ["resource_id"],
@@ -228,25 +369,43 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="execute_sql",
-                description="""Execute raw PostgreSQL SELECT query.
-
-⚠️ Advanced users only. For complex queries requiring full SQL.
-
-Security: Only SELECT allowed. INSERT/UPDATE/DELETE blocked.
-
-Examples:
-- Window functions: RANK() OVER (...)
-- CTEs: WITH subquery AS (...)
-- Complex aggregations: PERCENTILE_CONT(0.5) WITHIN GROUP
-
-Resource IDs must be double-quoted: FROM "uuid-here"
-""",
+                description=(
+                    f"Execute a raw PostgreSQL SELECT query against "
+                    f"{city}'s CKAN datastore.\n\n"
+                    "⚠️ Use this only when the structured `where` "
+                    "argument on `ckan__query_data` / "
+                    "`ckan__search_and_query` cannot express your filter "
+                    "(e.g. window functions, CTEs, joins, aggregations "
+                    "beyond ckan__aggregate_data).\n\n"
+                    "Security: Only SELECT allowed. INSERT/UPDATE/DELETE "
+                    "blocked.\n\n"
+                    "Concrete examples:\n"
+                    "- Closed on a specific date:\n"
+                    "    SELECT * FROM \"<resource_id>\" WHERE "
+                    "close_date >= '2026-04-29' AND close_date < "
+                    "'2026-04-30' AND case_status = 'Closed' LIMIT 100\n"
+                    "- Counts by day:\n"
+                    "    SELECT date_trunc('day', close_date) AS d, "
+                    "COUNT(*) FROM \"<resource_id>\" GROUP BY d "
+                    "ORDER BY d DESC LIMIT 30\n"
+                    "- Window functions: RANK() OVER (...)\n"
+                    "- CTEs: WITH subquery AS (...)\n\n"
+                    "Resource IDs must be double-quoted: "
+                    "FROM \"uuid-here\"\n\n"
+                    "Prerequisites:\n"
+                    "  - resource UUID for the FROM clause: get from "
+                    "`ckan__search_datasets` or `ckan__get_dataset`.\n"
+                    "  - field names: get from `ckan__get_schema`, or "
+                    "the 'Filterable columns' footer of any prior "
+                    "successful `ckan__query_data` / "
+                    "`ckan__search_and_query` call."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "PostgreSQL SELECT statement",
+                            "description": "PostgreSQL SELECT statement. Resource UUIDs in FROM must be double-quoted.",
                         },
                     },
                     "required": ["sql"],
@@ -254,32 +413,183 @@ Resource IDs must be double-quoted: FROM "uuid-here"
             ),
             ToolDefinition(
                 name="aggregate_data",
-                description=f"""Aggregate data with GROUP BY from {self.plugin_config.city_name}'s open data portal.
-
-Prerequisites: get_schema for field names
-
-Examples:
-- Count by field: group_by=["neighborhood"], metrics={{count: "count(*)"}}
-- Multiple metrics: metrics={{total: "count(*)", avg: "avg(field)"}}
-- With filters: filters={{"status": "Open"}}
-
-Supports: count(*), sum(), avg(), min(), max(), stddev()
-""",
+                description=(
+                    f"Aggregate data with GROUP BY from {city}'s open data "
+                    "portal.\n\n"
+                    "Prerequisites:\n"
+                    "  - `resource_id`: get from `ckan__search_datasets` / "
+                    "`ckan__get_dataset` (the `id` inside the `resources` "
+                    "array).\n"
+                    "  - field names for `group_by` / `metrics`: get from "
+                    "`ckan__get_schema`.\n\n"
+                    "Examples:\n"
+                    '- Count by field: group_by=["neighborhood"], '
+                    'metrics={"count": "count(*)"}\n'
+                    '- Multiple metrics: metrics={"total": "count(*)", '
+                    '"avg": "avg(field)"}\n'
+                    '- With filters: filters={"status": "Open"}\n\n'
+                    "Supports: count(*), sum(), avg(), min(), max(), stddev()."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "resource_id": {"type": "string"},
+                        "resource_id": {
+                            "type": "string",
+                            "description": (
+                                "CKAN resource UUID. Provenance: the `id` "
+                                "inside the `resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`."
+                            ),
+                        },
                         "group_by": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "description": "Field names to group by. Get exact names from `ckan__get_schema`.",
                         },
-                        "metrics": {"type": "object"},
+                        "metrics": {
+                            "type": "object",
+                            "description": "Map of alias -> aggregate expression, e.g. {\"count\": \"count(*)\"}.",
+                        },
                         "filters": {"type": "object"},
                         "having": {"type": "object"},
                         "order_by": {"type": "string"},
                         "limit": {"type": "integer", "default": 100},
                     },
                     "required": ["resource_id", "metrics"],
+                },
+            ),
+            ToolDefinition(
+                name="search_and_query",
+                description=(
+                    f"ONE-CALL keyword-to-data for {city}'s open data "
+                    "portal: searches for the best-matching dataset and "
+                    "immediately returns rows from its first datastore-"
+                    "loaded resource — no tool chaining required.\n\n"
+                    "Use this when you have a keyword (e.g. "
+                    "'311 service requests', 'parks', 'building permits') "
+                    "and want actual data rows. It combines "
+                    "`ckan__search_datasets` + `ckan__query_data` into a "
+                    "single server-side step, so you do NOT need to "
+                    "extract a resource_id from a previous response.\n\n"
+                    "Auto-picks the right resource: Boston datasets "
+                    "typically attach 5–7 resources (GeoJSON, KML, SHP, "
+                    "PDF, ArcGIS REST, CSV) but only the CSV is loaded "
+                    "into the queryable datastore. This tool walks the "
+                    "search results and skips datasets / resources that "
+                    "aren't datastore-active, so you don't get a 404 "
+                    "from a download-only resource.\n\n"
+                    "WHAT `query` MEANS: `query` matches dataset metadata "
+                    "(title, tags, description) — it does NOT filter ROWS. "
+                    "If the user asks for '311 requests closed on 4/29', "
+                    "the `query` finds the 311 dataset and `where` does "
+                    "the row filtering:\n"
+                    "  query=\"311\", where={\"close_date\": {\"gte\": "
+                    "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                    "\"case_status\": \"Closed\"}\n\n"
+                    "Returns: data rows from the chosen dataset's chosen "
+                    "resource, plus a 'Filterable columns' footer listing "
+                    "the schema (so you can refine with `where` or pivot "
+                    "to `ckan__execute_sql` for joins/CTEs/window funcs), "
+                    "an 'Other queryable resources in this dataset' "
+                    "block listing siblings (e.g. per-year archives), "
+                    "and a header showing which dataset and resource "
+                    "were used.\n\n"
+                    "MULTI-RESOURCE DATASETS: a single dataset can hold "
+                    "many queryable resources. Boston's 311 dataset has "
+                    "22 (a rolling 'NEW SYSTEM' view plus per-year "
+                    "archives 2011–2026). Use `resource_name` to pick a "
+                    "specific one — e.g. resource_name=\"2020\" picks "
+                    "'311 Service Requests - 2020'. If you don't pass "
+                    "`resource_name`, the first datastore-loaded "
+                    "resource is used (which is typically the rolling "
+                    "current view, NOT historical archives — so older "
+                    "questions need `resource_name`)."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Free-text keywords matched against "
+                                "DATASET METADATA (title/tags/desc), NOT "
+                                "row content. Use `where` (or "
+                                "`ckan__execute_sql`) to filter ROWS by "
+                                "date/status/etc. Examples: '311', "
+                                "'parks', 'building permits'."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of data rows to return (default: 100).",
+                            "default": 100,
+                        },
+                        "filters": {
+                            "type": "object",
+                            "description": (
+                                "EQUALITY-ONLY row filters (e.g. "
+                                "{\"case_status\": \"Closed\"}). For "
+                                "ranges/dates/IN/LIKE, use `where` "
+                                "instead."
+                            ),
+                        },
+                        "where": {
+                            "type": "object",
+                            "description": (
+                                "Structured WHERE clause for ranges, "
+                                "dates, IN, LIKE, NULL checks. Each "
+                                "entry is {field: scalar} (equality) or "
+                                "{field: {op: value, ...}} where op is "
+                                "one of: eq, ne, gt, gte, lt, lte, in, "
+                                "not_in, like, ilike, is_null. The "
+                                "right knob for 'closed on 2026-04-29': "
+                                "{\"close_date\": {\"gte\": "
+                                "\"2026-04-29\", \"lt\": \"2026-04-30\"}}."
+                            ),
+                        },
+                        "dataset_index": {
+                            "type": "integer",
+                            "description": (
+                                "Which search result to use (0 = best "
+                                "match). If omitted, walks the search "
+                                "results until one with a queryable "
+                                "(datastore_active) resource is found."
+                            ),
+                        },
+                        "resource_index": {
+                            "type": "integer",
+                            "description": (
+                                "Which resource within the chosen dataset "
+                                "to query. If omitted, auto-picks the "
+                                "first datastore_active resource (Boston "
+                                "datasets typically attach 5–7 resources "
+                                "but only the CSV is queryable). "
+                                "`resource_name` takes precedence."
+                            ),
+                        },
+                        "resource_name": {
+                            "type": "string",
+                            "description": (
+                                "Case-insensitive substring match on a "
+                                "resource's `name`. Use this to pick a "
+                                "specific archive when a dataset has "
+                                "multiple queryable resources (e.g. "
+                                "Boston's 311 dataset has per-year "
+                                "archives '311 Service Requests - 2020', "
+                                "'... - 2021', etc., plus a rolling "
+                                "'NEW SYSTEM'). Examples: "
+                                "resource_name=\"2020\" picks the 2020 "
+                                "archive; resource_name=\"NEW SYSTEM\" "
+                                "picks the rolling current view. The "
+                                "alternates list in any prior "
+                                "search_and_query response shows "
+                                "available names. Takes precedence over "
+                                "`resource_index`."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
                 },
             ),
         ]
@@ -300,12 +610,16 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
             if tool_name == "search_datasets":
                 query = arguments.get("query", "")
                 limit = arguments.get("limit", 20)
-                datasets = await self.search_datasets(query, limit)
+                datasets, total = await self._search_datasets_with_count(
+                    query, limit
+                )
                 return ToolResult(
                     content=[
                         {
                             "type": "text",
-                            "text": self._format_search_results(datasets),
+                            "text": self._format_search_results(
+                                datasets, total=total, limit=limit
+                            ),
                         }
                     ],
                     success=True,
@@ -338,14 +652,28 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                         success=False,
                         error_message="resource_id is required",
                     )
-                filters = arguments.get("filters", {})
+                filters = arguments.get("filters") or {}
+                where = arguments.get("where") or None
                 limit = arguments.get("limit", 100)
-                data = await self.query_data(resource_id, filters, limit)
+                records, fields, total, error = await self._query_with_schema(
+                    resource_id=resource_id,
+                    filters=filters,
+                    limit=limit,
+                    where=where,
+                )
+                if error:
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message=error,
+                    )
                 return ToolResult(
                     content=[
                         {
                             "type": "text",
-                            "text": self._format_query_results(data, limit),
+                            "text": self._format_query_results(
+                                records, fields, limit, total
+                            ),
                         }
                     ],
                     success=True,
@@ -388,9 +716,53 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 # Format SQL results
                 records = result.get("records", [])
                 fields = result.get("fields", [])
-                formatted_text = self._format_sql_results(records, fields)
+                effective_limit = result.get("effective_limit")
+                formatted_text = self._format_sql_results(
+                    records, fields, effective_limit=effective_limit
+                )
                 return ToolResult(
                     content=[{"type": "text", "text": formatted_text}],
+                    success=True,
+                )
+
+            elif tool_name == "search_and_query":
+                query = arguments.get("query")
+                if not query:
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message="query is required",
+                    )
+                limit = arguments.get("limit", 100)
+                filters = arguments.get("filters") or {}
+                where = arguments.get("where") or None
+                dataset_index = arguments.get("dataset_index")
+                resource_index = arguments.get("resource_index")
+                resource_name = arguments.get("resource_name")
+                composite = await self.search_and_query(
+                    query=query,
+                    limit=limit,
+                    filters=filters,
+                    where=where,
+                    dataset_index=dataset_index,
+                    resource_index=resource_index,
+                    resource_name=resource_name,
+                )
+                if composite.get("error"):
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message=composite.get(
+                            "message", "search_and_query failed"
+                        ),
+                    )
+                return ToolResult(
+                    content=[
+                        {
+                            "type": "text",
+                            "text": self._format_search_and_query(composite, limit),
+                        }
+                    ],
                     success=True,
                 )
 
@@ -425,7 +797,9 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                         error_message=result.get("message", "Aggregation failed"),
                     )
                 formatted = self._format_sql_results(
-                    result.get("records", []), result.get("fields", [])
+                    result.get("records", []),
+                    result.get("fields", []),
+                    effective_limit=result.get("effective_limit"),
                 )
                 return ToolResult(
                     content=[{"type": "text", "text": formatted}], success=True
@@ -456,12 +830,29 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
             limit: Maximum number of results
 
         Returns:
-            List of dataset metadata dictionaries
+            List of dataset metadata dictionaries (count-aware variant is
+            ``_search_datasets_with_count``).
         """
+        datasets, _count = await self._search_datasets_with_count(query, limit)
+        return datasets
+
+    async def _search_datasets_with_count(
+        self, query: str, limit: int = 20
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Same as search_datasets but also returns CKAN's `count` — the
+        true number of datasets matching the query, regardless of the row
+        cap. Lets the formatter say "20 of 47 matching datasets returned"
+        instead of just "Found 20"."""
         response = await self._call_ckan_api(
             "package_search", {"q": query, "rows": limit}
         )
-        return response.get("result", {}).get("results", [])
+        result = response.get("result", {})
+        count_val = result.get("count")
+        try:
+            count = int(count_val) if count_val is not None else None
+        except (TypeError, ValueError):
+            count = None
+        return result.get("results", []), count
 
     async def get_dataset(self, dataset_id: str) -> Dict[str, Any]:
         """Get detailed metadata for a specific dataset.
@@ -480,26 +871,183 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         resource_id: str,
         filters: Optional[Dict[str, Any]] = None,
         limit: int = 100,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Query data from a specific resource.
 
         Args:
             resource_id: Resource ID
-            filters: Optional filters (field: value pairs)
+            filters: Equality-only filters (field: value) passed to
+                CKAN's datastore_search
             limit: Maximum number of records
+            where: Structured WHERE spec supporting comparison operators
+                (gt/gte/lt/lte/in/not_in/like/ilike/is_null). When set,
+                routes through datastore_search_sql for a real WHERE clause.
 
         Returns:
-            List of data records
+            List of data records (the schema-aware variant is
+            ``_query_with_schema``).
         """
-        params = {"resource_id": resource_id, "limit": limit}
+        records, _fields, _total, error = await self._query_with_schema(
+            resource_id=resource_id,
+            filters=filters,
+            limit=limit,
+            where=where,
+        )
+        if error:
+            raise RuntimeError(error)
+        return records
 
-        # Convert filters to CKAN filter format
+    async def _count_via_sql(
+        self,
+        resource_id: str,
+        where_sql: str,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Run a SELECT COUNT(*) with the same filters to discover the true
+        row total when a SELECT * hit the limit.
+
+        Returns ``None`` if the count call itself fails (we'd rather show
+        a 'TRUNCATED' warning than block the data response on a failed
+        count). Returns the integer total on success.
+        """
+        try:
+            sql_parts = [f'SELECT COUNT(*) AS n FROM "{resource_id}"']
+            if where_sql:
+                sql_parts.append(f" WHERE {where_sql}")
+            if filters:
+                eq_conds = [
+                    SafeSQLBuilder.build_filter_condition(f, v)
+                    for f, v in filters.items()
+                ]
+                joiner = " AND " if where_sql else " WHERE "
+                sql_parts.append(joiner + " AND ".join(eq_conds))
+            sql = "".join(sql_parts)
+            result = await self.execute_sql(sql)
+            if result.get("error"):
+                return None
+            recs = result.get("records") or []
+            if not recs:
+                return None
+            n = recs[0].get("n") or recs[0].get("count")
+            if n is None:
+                return None
+            try:
+                return int(n)
+            except (TypeError, ValueError):
+                return None
+        except Exception:
+            return None
+
+    async def _query_with_schema(
+        self,
+        resource_id: str,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 100,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Optional[int],
+        Optional[str],
+    ]:
+        """Query datastore and return (records, fields, total, error).
+
+        ``total`` is the true number of rows matching the filter, regardless
+        of LIMIT. CKAN's datastore_search returns this for free; for the
+        SQL (``where``) path we issue a follow-up COUNT(*) only when the
+        result hit the limit (otherwise len(records) IS the total).
+        Returns ``None`` when we couldn't determine a total.
+
+        Routes through datastore_search_sql when ``where`` is set so the
+        caller can express ranges/IN/LIKE; otherwise falls back to the
+        cheaper datastore_search equality path.
+        """
+        if where:
+            try:
+                validated_id = SafeSQLBuilder.validate_resource_id(resource_id)
+                where_sql = SafeSQLBuilder.build_where_clause(where)
+                limit_int = SafeSQLBuilder.clamp_limit(limit)
+            except ValueError as e:
+                return [], [], None, str(e)
+
+            sql_parts = [f'SELECT * FROM "{validated_id}"']
+            if where_sql:
+                sql_parts.append(f" WHERE {where_sql}")
+            if filters:
+                # Equality filters can ride alongside `where` clauses.
+                try:
+                    eq_conds = [
+                        SafeSQLBuilder.build_filter_condition(f, v)
+                        for f, v in filters.items()
+                    ]
+                except ValueError as e:
+                    return [], [], None, str(e)
+                joiner = " AND " if where_sql else " WHERE "
+                sql_parts.append(joiner + " AND ".join(eq_conds))
+            sql_parts.append(f" LIMIT {limit_int}")
+            sql = "".join(sql_parts)
+
+            result = await self.execute_sql(sql)
+            if result.get("error"):
+                return [], [], None, result.get(
+                    "message", "SQL execution failed"
+                )
+            records = result.get("records", [])
+            fields = result.get("fields", [])
+
+            # If we hit the LIMIT exactly, we don't actually know the total —
+            # do a cheap COUNT(*) follow-up so the model gets a real number
+            # instead of mistaking the limit for the count.
+            total: Optional[int]
+            if len(records) >= limit_int:
+                total = await self._count_via_sql(
+                    validated_id, where_sql, filters
+                )
+            else:
+                total = len(records)
+
+            return records, fields, total, None
+
+        # No `where` → cheap datastore_search path.
+        params: Dict[str, Any] = {"resource_id": resource_id, "limit": limit}
         if filters:
-            for field, value in filters.items():
-                params[f"filters[{field}]"] = value
+            params["filters"] = filters
 
-        response = await self._call_ckan_api("datastore_search", params)
-        return response.get("result", {}).get("records", [])
+        try:
+            response = await self._call_ckan_api("datastore_search", params)
+        except RuntimeError as e:
+            msg = str(e)
+            if "404" in msg or "not found" in msg.lower():
+                return (
+                    [],
+                    [],
+                    None,
+                    f"{msg}\n"
+                    "Hint: this resource may exist as a file download "
+                    "(GeoJSON/KML/SHP/PDF) but not be loaded into the "
+                    "datastore (datastore_active=false). Call "
+                    "ckan__get_dataset on the parent dataset to find a "
+                    "QUERYABLE resource (typically the CSV one), or use "
+                    "ckan__search_and_query, which auto-picks the "
+                    "datastore-loaded resource.",
+                )
+            return [], [], None, msg
+
+        result = response.get("result", {})
+        # CKAN returns `total` for free here — a true count of rows
+        # matching the filter, not capped by limit.
+        total_val = result.get("total")
+        try:
+            total = int(total_val) if total_val is not None else None
+        except (TypeError, ValueError):
+            total = None
+        return (
+            result.get("records", []),
+            result.get("fields", []),
+            total,
+            None,
+        )
 
     async def get_schema(self, resource_id: str) -> Dict[str, Any]:
         """Get schema information for a resource.
@@ -523,12 +1071,17 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
             sql: PostgreSQL SELECT statement
 
         Returns:
-            Dictionary with success flag, records, fields, or error message
+            Dictionary with success flag, records, fields, effective_limit,
+            or error message
         """
         # Validate SQL
         is_valid, error = SQLValidator.validate_query(sql)
         if not is_valid:
             return {"error": True, "message": error}
+
+        # Bound upstream scan cost: append LIMIT if the caller didn't set one.
+        sql = SQLValidator.enforce_row_limit(sql)
+        effective_limit = SQLValidator.extract_top_level_limit(sql)
 
         # Log SQL execution (truncated for security)
         logger.info("Executing SQL", extra={"sql": sql[:500]})
@@ -545,6 +1098,7 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 "success": True,
                 "records": result.get("result", {}).get("records", []),
                 "fields": result.get("result", {}).get("fields", []),
+                "effective_limit": effective_limit,
             }
         except Exception as e:
             logger.error(f"SQL execution failed: {e}", exc_info=True)
@@ -562,58 +1116,309 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
     ) -> Dict[str, Any]:
         """Aggregate data with GROUP BY.
 
-        Args:
-            resource_id: Resource ID (must be valid UUID)
-            group_by: List of fields to group by
-            metrics: Dictionary of metric_name: sql_expression (e.g., {"count": "count(*)"})
-            filters: Optional WHERE clause filters (field: value pairs)
-            having: Optional HAVING clause filters (expression: value pairs)
-            order_by: Optional field to order by
-            limit: Maximum number of results
-
-        Returns:
-            Dictionary with success flag, records, fields, or error message
+        Every identifier, metric expression, filter value, and LIMIT is
+        validated against a strict allowlist via ``SafeSQLBuilder`` before
+        the SQL is assembled, so caller-supplied strings cannot escape into
+        the generated query.
         """
-        # SELECT
-        select_fields = ", ".join(group_by) if group_by else ""
-        select_metrics = ", ".join(
-            [f"{expr} as {name}" for name, expr in metrics.items()]
+        try:
+            resource_id = SafeSQLBuilder.validate_resource_id(resource_id)
+            if not metrics:
+                raise ValueError("metrics must be non-empty")
+
+            group_by_quoted = [
+                SafeSQLBuilder.quote_identifier(f) for f in (group_by or [])
+            ]
+
+            metric_parts: List[str] = []
+            for alias, expr in metrics.items():
+                alias_quoted = SafeSQLBuilder.quote_identifier(alias)
+                expr_quoted = SafeSQLBuilder.validate_metric_expr(expr)
+                metric_parts.append(f"{expr_quoted} AS {alias_quoted}")
+
+            select_clause = ", ".join(group_by_quoted + metric_parts)
+
+            where_clause = ""
+            if filters:
+                conditions = [
+                    SafeSQLBuilder.build_filter_condition(f, v)
+                    for f, v in filters.items()
+                ]
+                where_clause = " WHERE " + " AND ".join(conditions)
+
+            group_clause = ""
+            if group_by_quoted:
+                group_clause = " GROUP BY " + ", ".join(group_by_quoted)
+
+            having_clause = ""
+            if having:
+                having_parts: List[str] = []
+                for expr, value in having.items():
+                    expr_quoted = SafeSQLBuilder.validate_metric_expr(expr)
+                    if isinstance(value, bool) or not isinstance(
+                        value, (int, float)
+                    ):
+                        raise ValueError(
+                            f"HAVING value must be numeric: {value!r}"
+                        )
+                    having_parts.append(f"{expr_quoted} > {value}")
+                having_clause = " HAVING " + " AND ".join(having_parts)
+
+            order_clause = ""
+            if order_by:
+                order_clause = " ORDER BY " + SafeSQLBuilder.validate_order_by(
+                    order_by
+                )
+
+            limit_int = SafeSQLBuilder.clamp_limit(limit)
+        except ValueError as e:
+            return {"error": True, "message": str(e)}
+
+        sql = (
+            f'SELECT {select_clause} FROM "{resource_id}"'
+            f"{where_clause}{group_clause}{having_clause}{order_clause}"
+            f" LIMIT {limit_int}"
         )
-        select_clause = (
-            f"{select_fields}, {select_metrics}" if select_fields else select_metrics
-        )
-
-        # WHERE
-        where_clause = ""
-        if filters:
-            conditions = []
-            for field, value in filters.items():
-                if isinstance(value, str):
-                    # Escape single quotes in SQL strings
-                    escaped_value = value.replace("'", "''")
-                    conditions.append(f"{field} = '{escaped_value}'")
-                elif value is None:
-                    conditions.append(f"{field} IS NULL")
-                else:
-                    conditions.append(f"{field} = {value}")
-            where_clause = "WHERE " + " AND ".join(conditions)
-
-        # GROUP BY
-        group_clause = f"GROUP BY {', '.join(group_by)}" if group_by else ""
-
-        # HAVING
-        having_clause = ""
-        if having:
-            conditions = [f"{expr} > {value}" for expr, value in having.items()]
-            having_clause = "HAVING " + " AND ".join(conditions)
-
-        # ORDER BY
-        order_clause = f"ORDER BY {order_by}" if order_by else ""
-
-        # Build SQL
-        sql = f'SELECT {select_clause} FROM "{resource_id}" {where_clause} {group_clause} {having_clause} {order_clause} LIMIT {limit}'.strip()
 
         return await self.execute_sql(sql)
+
+    @staticmethod
+    def _queryable_resources(dataset: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """All datastore_active resources in a dataset, in package_show order."""
+        return [r for r in (dataset.get("resources") or []) if r.get("datastore_active")]
+
+    @classmethod
+    def _resource_by_name(
+        cls,
+        dataset: Dict[str, Any],
+        name_query: str,
+        queryable_only: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Pick the first resource whose `name` contains `name_query`
+        (case-insensitive substring)."""
+        if not name_query:
+            return None
+        needle = name_query.casefold()
+        candidates = (
+            cls._queryable_resources(dataset)
+            if queryable_only
+            else (dataset.get("resources") or [])
+        )
+        for r in candidates:
+            res_name = (r.get("name") or "").casefold()
+            if needle in res_name:
+                return r
+        return None
+
+    async def search_and_query(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        where: Optional[Dict[str, Any]] = None,
+        dataset_index: Optional[int] = None,
+        resource_index: Optional[int] = None,
+        resource_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search for a dataset and immediately query a queryable resource.
+
+        Combines search_datasets + query_data into one server-side step so
+        callers don't have to extract a resource_id from a previous response.
+
+        Resource selection precedence (highest to lowest):
+          1. ``resource_name`` (substring match on resource ``name``).
+          2. ``resource_index`` (explicit position in the dataset's
+             resources array).
+          3. First ``datastore_active`` resource in the dataset.
+
+        Returns:
+            Dict with either {"error": True, "message": ...} or
+            {"dataset": {...}, "resource": {...}, "records": [...]}.
+        """
+        explicit_dataset = dataset_index is not None
+        explicit_resource = resource_index is not None
+        ds_idx = dataset_index or 0
+        # Cap how many search results we fetch so dataset_index can pick a
+        # non-best match without an unbounded scan.
+        search_rows = max(ds_idx + 1, 10)
+        datasets = await self.search_datasets(query, limit=search_rows)
+        if not datasets:
+            return {
+                "error": True,
+                "message": (
+                    f"No datasets found for query {query!r} in "
+                    f"{self.plugin_config.city_name}'s open data portal."
+                ),
+            }
+
+        if explicit_dataset:
+            if ds_idx < 0 or ds_idx >= len(datasets):
+                return {
+                    "error": True,
+                    "message": (
+                        f"dataset_index {ds_idx} is out of range "
+                        f"(found {len(datasets)} dataset(s))."
+                    ),
+                }
+            candidate_indices = [ds_idx]
+        else:
+            # Auto-walk: try the best match first, fall through to the next
+            # datasets if it has no queryable resource.
+            candidate_indices = list(range(len(datasets)))
+
+        chosen_dataset: Optional[Dict[str, Any]] = None
+        chosen_resource: Optional[Dict[str, Any]] = None
+        skipped_summary: List[str] = []
+
+        for idx in candidate_indices:
+            ds = datasets[idx]
+            resources = ds.get("resources") or []
+            if not resources:
+                skipped_summary.append(
+                    f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                    "no resources"
+                )
+                continue
+
+            # 1) name match wins if provided
+            if resource_name:
+                matched = self._resource_by_name(ds, resource_name)
+                if matched is not None:
+                    chosen_dataset, chosen_resource = ds, matched
+                    break
+                # Only error out if the user fixed the dataset too.
+                if explicit_dataset:
+                    queryable_names = [
+                        r.get("name") or "(unnamed)"
+                        for r in self._queryable_resources(ds)
+                    ]
+                    return {
+                        "error": True,
+                        "message": (
+                            f"No queryable resource in dataset "
+                            f"{ds.get('id')!r} has a name matching "
+                            f"{resource_name!r}. Available queryable "
+                            f"resource names: "
+                            f"{queryable_names or '(none)'}."
+                        ),
+                    }
+                # Otherwise fall through and try the next dataset.
+                skipped_summary.append(
+                    f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                    f"no resource name matching {resource_name!r}"
+                )
+                continue
+
+            # 2) explicit positional pick
+            if explicit_resource:
+                if resource_index < 0 or resource_index >= len(resources):
+                    return {
+                        "error": True,
+                        "message": (
+                            f"resource_index {resource_index} is out of "
+                            f"range for dataset {ds.get('id')!r} "
+                            f"(has {len(resources)} resource(s))."
+                        ),
+                    }
+                resource = resources[resource_index]
+                if not self._is_queryable(resource):
+                    return {
+                        "error": True,
+                        "message": (
+                            f"resource_index {resource_index} of dataset "
+                            f"{ds.get('id')!r} has datastore_active=false "
+                            "(download-only). Pick a different "
+                            "resource_index, or omit it to auto-pick the "
+                            "queryable one."
+                        ),
+                    }
+                chosen_dataset, chosen_resource = ds, resource
+                break
+
+            # 3) auto-pick the first queryable resource
+            queryable = self._first_queryable_resource(ds)
+            if queryable:
+                chosen_dataset, chosen_resource = ds, queryable
+                break
+
+            formats = sorted(
+                {
+                    (r.get("format") or "?").upper()
+                    for r in resources
+                }
+            )
+            skipped_summary.append(
+                f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                f"no datastore-loaded resource (formats: {', '.join(formats)})"
+            )
+
+        # If we walked all datasets and resource_name was set but never
+        # matched, give a name-specific error rather than the generic
+        # "no queryable resource" one.
+        if (
+            chosen_dataset is None
+            and resource_name
+            and not explicit_dataset
+        ):
+            return {
+                "error": True,
+                "message": (
+                    f"No dataset in the {len(datasets)} matches for query "
+                    f"{query!r} has a queryable resource whose name "
+                    f"matches {resource_name!r}.\nSkipped:\n"
+                    + ("\n".join(skipped_summary) or "  (no datasets inspected)")
+                ),
+            }
+
+        if chosen_dataset is None or chosen_resource is None:
+            details = (
+                "\n".join(skipped_summary)
+                if skipped_summary
+                else "  (no datasets inspected)"
+            )
+            return {
+                "error": True,
+                "message": (
+                    f"No queryable (datastore_active) resource found among "
+                    f"{len(datasets)} matching dataset(s) for query "
+                    f"{query!r}.\nSkipped:\n{details}\nTry a different "
+                    "keyword or call ckan__get_dataset to inspect resources."
+                ),
+            }
+
+        resource_id = chosen_resource.get("id")
+        if not resource_id:
+            return {
+                "error": True,
+                "message": (
+                    f"Chosen resource of dataset {chosen_dataset.get('id')!r}"
+                    " has no id."
+                ),
+            }
+
+        records, fields, total, error = await self._query_with_schema(
+            resource_id=resource_id,
+            filters=filters or None,
+            where=where,
+            limit=limit,
+        )
+        if error:
+            return {
+                "error": True,
+                "message": (
+                    f"Found dataset {chosen_dataset.get('id')!r} resource "
+                    f"{resource_id!r} but query_data failed: {error}"
+                ),
+            }
+
+        return {
+            "dataset": chosen_dataset,
+            "resource": chosen_resource,
+            "records": records,
+            "fields": fields,
+            "total": total,
+            "alternate_datasets": datasets,
+        }
 
     async def health_check(self) -> bool:
         """Check if CKAN API is accessible.
@@ -628,14 +1433,74 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
             logger.error(f"Health check failed: {e}")
             return False
 
-    def _format_search_results(self, datasets: List[Dict[str, Any]]) -> str:
+    def _format_search_results(
+        self,
+        datasets: List[Dict[str, Any]],
+        total: Optional[int] = None,
+        limit: int = 20,
+    ) -> str:
         """Format search results for user display."""
         if not datasets:
             return f"No datasets found in {self.plugin_config.city_name}'s open data portal."
 
-        lines = [
-            f"Found {len(datasets)} dataset(s) in {self.plugin_config.city_name}'s open data portal:\n"
-        ]
+        suggested_resource_id: Optional[str] = None
+        suggested_dataset_id: Optional[str] = None
+        for ds in datasets:
+            queryable = self._first_queryable_resource(ds)
+            if queryable and queryable.get("id"):
+                suggested_resource_id = queryable.get("id")
+                suggested_dataset_id = ds.get("id")
+                break
+
+        lines: List[str] = []
+        if suggested_resource_id:
+            lines.extend(
+                [
+                    "=== NEXT STEP (read this first) ===",
+                    f"suggested_resource_id: {suggested_resource_id}",
+                    "suggested_next_tool: ckan__query_data",
+                    f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
+                    "(this is the datastore-loaded resource — only such "
+                    "resources can be queried; others are file downloads.)",
+                    "(or use ckan__search_and_query for a one-call "
+                    "keyword-to-data flow.)",
+                    "===================================",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "=== NEXT STEP ===",
+                    "None of the matched datasets have a queryable resource "
+                    "(datastore_active=true). The attached resources are "
+                    "file downloads only. Try a different search keyword, "
+                    "or call ckan__get_dataset to inspect non-datastore "
+                    "resources.",
+                    "=================",
+                    "",
+                ]
+            )
+
+        # Lead with the X-of-Y framing so the model can't mistake the
+        # results-shown count for the count of matching datasets.
+        n_returned = len(datasets)
+        if total is not None and total > n_returned:
+            lines.append(
+                f"{n_returned} of {total} matching dataset(s) shown "
+                f"(limit={limit}; raise limit to see more) in "
+                f"{self.plugin_config.city_name}'s open data portal:\n"
+            )
+        elif total is not None:
+            lines.append(
+                f"{total} matching dataset(s) (full result, limit={limit}) "
+                f"in {self.plugin_config.city_name}'s open data portal:\n"
+            )
+        else:
+            lines.append(
+                f"{n_returned} dataset(s) in "
+                f"{self.plugin_config.city_name}'s open data portal:\n"
+            )
 
         for i, dataset in enumerate(datasets, 1):
             title = dataset.get("title", "Untitled")
@@ -645,9 +1510,26 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 if dataset.get("notes")
                 else "No description"
             )
+            resources = dataset.get("resources") or []
+            queryable = self._first_queryable_resource(dataset)
+            queryable_id = queryable.get("id") if queryable else None
+            queryable_format = queryable.get("format") if queryable else None
 
             lines.append(f"{i}. {title}")
-            lines.append(f"   ID: {dataset_id}")
+            lines.append(f"   dataset_id: {dataset_id}")
+            if queryable_id:
+                fmt = f" [{queryable_format}]" if queryable_format else ""
+                lines.append(
+                    f"   resource_id (use this with ckan__query_data){fmt}: "
+                    f"{queryable_id}"
+                )
+            elif resources:
+                lines.append(
+                    f"   resource_id: NONE QUERYABLE — this dataset has "
+                    f"{len(resources)} resource(s) but none are loaded into "
+                    "the datastore (datastore_active=false). Use "
+                    "ckan__get_dataset for download URLs."
+                )
             lines.append(f"   Description: {notes}")
             lines.append(
                 f"   Portal: {self.plugin_config.portal_url}/dataset/{dataset_id}"
@@ -656,8 +1538,12 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
 
         lines.append(
             f"View all datasets at: {self.plugin_config.portal_url}\n"
-            f"Use get_dataset tool with a dataset ID to get more details."
+            f"Use ckan__get_dataset with a dataset_id (above) for full resource details, "
+            f"or ckan__query_data with a resource_id to fetch rows."
         )
+        if suggested_dataset_id:
+            # Hint for narrative chaining: makes the dataset_id discoverable too.
+            lines.append(f"suggested_dataset_id: {suggested_dataset_id}")
 
         return "\n".join(lines)
 
@@ -667,17 +1553,49 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         dataset_id = dataset.get("id", "unknown")
         notes = dataset.get("notes", "No description")
         organization = dataset.get("organization", {}).get("title", "Unknown")
-        resources = dataset.get("resources", [])
+        resources = dataset.get("resources", []) or []
 
-        lines = [
-            f"Dataset: {title}",
-            f"ID: {dataset_id}",
-            f"Organization: {organization}",
-            f"Description: {notes}",
-            "",
-            f"Portal URL: {self.plugin_config.portal_url}/dataset/{dataset_id}",
-            "",
-        ]
+        queryable = self._first_queryable_resource(dataset)
+        suggested_resource_id = queryable.get("id") if queryable else None
+
+        lines: List[str] = []
+        if suggested_resource_id:
+            lines.extend(
+                [
+                    "=== NEXT STEP (read this first) ===",
+                    f"suggested_resource_id: {suggested_resource_id}",
+                    "suggested_next_tool: ckan__query_data",
+                    f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
+                    "(this is the datastore-loaded resource; the others are "
+                    "file downloads only.)",
+                    "===================================",
+                    "",
+                ]
+            )
+        elif resources:
+            lines.extend(
+                [
+                    "=== NEXT STEP ===",
+                    f"This dataset has {len(resources)} resource(s) but none "
+                    "are loaded into the datastore (datastore_active=false), "
+                    "so ckan__query_data will not work on them. They are "
+                    "file downloads — see URLs below.",
+                    "=================",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                f"Dataset: {title}",
+                f"dataset_id: {dataset_id}",
+                f"Organization: {organization}",
+                f"Description: {notes}",
+                "",
+                f"Portal URL: {self.plugin_config.portal_url}/dataset/{dataset_id}",
+                "",
+            ]
+        )
 
         if resources:
             lines.append(f"Resources ({len(resources)}):")
@@ -685,22 +1603,62 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 res_name = resource.get("name", "Unnamed")
                 res_id = resource.get("id", "unknown")
                 res_format = resource.get("format", "unknown")
-                lines.append(f"  {i}. {res_name} ({res_format})")
-                lines.append(f"     Resource ID: {res_id}")
-                lines.append(
-                    f"     Use query_data tool with resource_id='{res_id}' to query this data"
-                )
+                res_url = resource.get("url", "")
+                queryable_flag = self._is_queryable(resource)
+                marker = "QUERYABLE" if queryable_flag else "DOWNLOAD-ONLY"
+                lines.append(f"  {i}. [{marker}] {res_name} ({res_format})")
+                lines.append(f"     resource_id: {res_id}")
+                if queryable_flag:
+                    lines.append(
+                        f"     Use ckan__query_data with resource_id=\"{res_id}\" to fetch rows."
+                    )
+                else:
+                    if res_url:
+                        lines.append(f"     download_url: {res_url}")
+                    lines.append(
+                        "     (not loaded into datastore — ckan__query_data "
+                        "will return 404 for this resource_id)"
+                    )
         else:
-            lines.append("No resources available for this dataset.")
+            lines.append(
+                "No resources available for this dataset. Try a different "
+                "dataset_id or use ckan__search_datasets again."
+            )
 
         return "\n".join(lines)
 
-    def _format_query_results(self, records: List[Dict[str, Any]], limit: int) -> str:
+    def _format_query_results(
+        self,
+        records: List[Dict[str, Any]],
+        fields: Optional[List[Dict[str, Any]]] = None,
+        limit: int = 100,
+        total: Optional[int] = None,
+    ) -> str:
         """Format query results for user display."""
-        if not records:
-            return "No records found matching the query."
+        n_returned = len(records)
+        truncated_warning = self._format_truncation_block(
+            n_returned, limit, total
+        )
 
-        lines = [f"Found {len(records)} record(s) (showing up to {limit}):\n"]
+        if not records:
+            text = "No records found matching the query."
+            parts = [truncated_warning, text] if truncated_warning else [text]
+            schema_footer = self._format_schema_footer(fields)
+            if schema_footer:
+                parts.append("")
+                parts.append(schema_footer)
+            return "\n".join(parts)
+
+        lines: List[str] = []
+        if truncated_warning:
+            lines.append(truncated_warning)
+            lines.append("")
+
+        # Header line: lead with the X-of-Y framing so the model can't
+        # mistake the rows-returned count for the answer to a counting
+        # question.
+        lines.append(self._format_count_header(n_returned, limit, total))
+        lines.append("")
 
         # Show first few records as examples
         for i, record in enumerate(records[:5], 1):
@@ -710,9 +1668,112 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                     lines.append(f"  {key}: {value}")
             lines.append("")
 
-        if len(records) > 5:
-            lines.append(f"... and {len(records) - 5} more record(s)")
+        if n_returned > 5:
+            lines.append(f"... and {n_returned - 5} more record(s) returned")
 
+        schema_footer = self._format_schema_footer(fields)
+        if schema_footer:
+            lines.append("")
+            lines.append(schema_footer)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_count_header(
+        n_returned: int,
+        limit: int,
+        total: Optional[int],
+        unit: str = "rows",
+    ) -> str:
+        """One-line "X of Y" summary used at the top of every row-returning
+        response. The model has been mistaking returned-rows for true count;
+        this phrasing makes the partial/total distinction unambiguous."""
+        if total is not None and total > n_returned:
+            return (
+                f"{n_returned} of {total} {unit} returned "
+                f"(limit={limit}; raise limit or use ckan__aggregate_data "
+                "for full count)."
+            )
+        if total is not None:
+            # total == n_returned, all rows returned
+            return f"{total} {unit} returned (full result, limit={limit})."
+        # total unknown
+        return (
+            f"{n_returned} {unit} returned (limit={limit}, "
+            "true total unknown — see TRUNCATED warning above if any)."
+        )
+
+    def _format_truncation_block(
+        self,
+        n_returned: int,
+        limit: int,
+        total: Optional[int],
+    ) -> str:
+        """Emit a clear warning when the result set is — or might be —
+        truncated by LIMIT.
+
+        Returns ``""`` when no warning is needed (result fits within limit
+        and total is known/equal to returned)."""
+        # Total known and matches returned → fits within limit, no warning.
+        if total is not None and total <= n_returned:
+            return ""
+
+        # Total known but exceeds returned → exact truncation, exact total.
+        if total is not None and total > n_returned:
+            return (
+                "=== TRUNCATED ===\n"
+                f"This query has {total} matching rows, but only "
+                f"{n_returned} were returned (limit={limit}). For "
+                "counting questions, the answer is "
+                f"{total}, NOT {n_returned}. To return more rows, raise "
+                "`limit` (max 10000) or use `ckan__execute_sql` with "
+                "your own LIMIT/ORDER BY. For just the count, use "
+                "ckan__aggregate_data with metrics="
+                '{"count": "count(*)"} and a matching filter — '
+                "it's cheaper than fetching rows.\n"
+                "================="
+            )
+
+        # Total unknown and we hit the limit exactly → likely truncated.
+        if total is None and n_returned >= limit:
+            return (
+                "=== MAY BE TRUNCATED ===\n"
+                f"Result returned exactly the requested limit "
+                f"({limit}) and the true total could not be determined. "
+                "Treat this as a possibly-incomplete sample. For "
+                "counting questions, do NOT report "
+                f"{n_returned} as the answer — use ckan__aggregate_data "
+                'with metrics={"count": "count(*)"} and the same '
+                "filter, or re-run with a higher limit.\n"
+                "========================"
+            )
+
+        return ""
+
+    def _format_schema_footer(
+        self, fields: Optional[List[Dict[str, Any]]]
+    ) -> str:
+        """Render a per-call 'Filterable columns' block listing every field
+        the model can pass to ``where``, ``filters``, or reference in
+        ``execute_sql``.
+
+        We surface this on every successful row-returning call so the next
+        pivot (e.g. 'now filter by close_date') is a one-shot."""
+        if not fields:
+            return ""
+        usable = [
+            f for f in fields if f.get("id") and f.get("id") != "_id"
+        ]
+        if not usable:
+            return ""
+        lines = [
+            "Filterable columns (use these names in `where`, `filters`, "
+            "or `execute_sql`):"
+        ]
+        for f in usable:
+            fid = f.get("id")
+            ftype = f.get("type", "?")
+            lines.append(f"  - {fid} ({ftype})")
         return "\n".join(lines)
 
     def _format_schema(self, fields: List[Dict[str, Any]]) -> str:
@@ -733,22 +1794,176 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
 
         return "\n".join(lines)
 
+    def _format_search_and_query(
+        self, composite: Dict[str, Any], limit: int
+    ) -> str:
+        """Format a search_and_query composite result for user display."""
+        dataset = composite.get("dataset", {}) or {}
+        resource = composite.get("resource", {}) or {}
+        records = composite.get("records", []) or []
+        fields = composite.get("fields", []) or []
+        total = composite.get("total")
+        alternates = composite.get("alternate_datasets", []) or []
+
+        dataset_id = dataset.get("id", "unknown")
+        dataset_title = dataset.get("title", "Untitled")
+        resource_id = resource.get("id", "unknown")
+        resource_name = resource.get("name", "Unnamed")
+        n_returned = len(records)
+
+        count_line = self._format_count_header(n_returned, limit, total)
+
+        lines: List[str] = []
+        truncated_warning = self._format_truncation_block(
+            n_returned, limit, total
+        )
+        if truncated_warning:
+            lines.append(truncated_warning)
+            lines.append("")
+
+        lines.extend(
+            [
+                "=== search_and_query result ===",
+                f"matched_dataset: {dataset_title}",
+                f"dataset_id: {dataset_id}",
+                f"resource_id (use with ckan__query_data): {resource_id}",
+                f"resource_name: {resource_name}",
+                count_line,
+                "================================",
+                "",
+            ]
+        )
+
+        if not records:
+            lines.append(
+                "No rows returned. Try broadening filters or pick a different "
+                "dataset/resource (see alternates below)."
+            )
+        else:
+            if total is not None and total > n_returned:
+                preview_caption = (
+                    f"Showing first 5 of {n_returned} returned "
+                    f"(true total: {total}):"
+                )
+            else:
+                preview_caption = f"Showing first 5 of {n_returned} returned:"
+            lines.append(preview_caption)
+            for i, record in enumerate(records[:5], 1):
+                lines.append(f"Record {i}:")
+                for key, value in record.items():
+                    if key != "_id":
+                        lines.append(f"  {key}: {value}")
+                lines.append("")
+            if n_returned > 5:
+                lines.append(f"... and {n_returned - 5} more record(s) returned")
+
+        schema_footer = self._format_schema_footer(fields)
+        if schema_footer:
+            lines.append("")
+            lines.append(schema_footer)
+
+        # Sibling queryable resources within the SAME dataset. Boston's 311
+        # dataset has 22 (a rolling view + per-year archives back to 2011)
+        # — without this block the model can't see them.
+        sibling_queryables = self._queryable_resources(dataset)
+        chosen_resource_id = resource.get("id")
+        siblings = [
+            r for r in sibling_queryables if r.get("id") != chosen_resource_id
+        ]
+        if siblings:
+            lines.append("")
+            lines.append(
+                "Other queryable resources in this dataset "
+                "(pass resource_name=... to pick one):"
+            )
+            for r in siblings:
+                r_name = r.get("name") or "(unnamed)"
+                r_fmt = r.get("format") or "?"
+                r_id = r.get("id") or "?"
+                lines.append(f"  - {r_name} [{r_fmt}]")
+                lines.append(f"    resource_id: {r_id}")
+
+        if len(alternates) > 1:
+            lines.append("")
+            lines.append(
+                "Other matching datasets (pass dataset_index=N to switch):"
+            )
+            chosen_dataset_id = dataset.get("id")
+            for i, alt in enumerate(alternates):
+                if alt.get("id") == chosen_dataset_id:
+                    continue  # skip the dataset we already returned rows for
+                alt_title = alt.get("title", "Untitled")
+                alt_id = alt.get("id", "unknown")
+                alt_queryable = self._first_queryable_resource(alt)
+                lines.append(f"  [dataset_index={i}] {alt_title}")
+                lines.append(f"    dataset_id: {alt_id}")
+                if alt_queryable:
+                    lines.append(
+                        f"    resource_id (queryable): "
+                        f"{alt_queryable.get('id')}"
+                    )
+                else:
+                    lines.append(
+                        "    (no datastore-loaded resource — "
+                        "download-only)"
+                    )
+
+        return "\n".join(lines)
+
     def _format_sql_results(
-        self, records: List[Dict[str, Any]], fields: List[Dict[str, Any]]
+        self,
+        records: List[Dict[str, Any]],
+        fields: List[Dict[str, Any]],
+        effective_limit: Optional[int] = None,
     ) -> str:
         """Format SQL query results for user display.
 
         Args:
             records: List of record dictionaries
             fields: List of field metadata dictionaries
+            effective_limit: The LIMIT clause that was actually executed —
+                either user-supplied or the enforced default. Used to
+                detect truncation: if len(records) >= effective_limit, the
+                result was almost certainly capped.
 
         Returns:
             Formatted string representation of results
         """
-        if not records:
-            return "No records found matching the SQL query."
+        n_returned = len(records)
 
-        lines = [f"SQL Query Results: {len(records)} record(s)\n"]
+        # Heuristic truncation detection — datastore_search_sql doesn't
+        # return a "total"; the only signal is "did we hit our LIMIT?"
+        truncation_block = ""
+        if effective_limit is not None and n_returned >= effective_limit:
+            truncation_block = (
+                "=== MAY BE TRUNCATED ===\n"
+                f"This SQL returned exactly the LIMIT ({effective_limit}) "
+                "rows. The true total could not be determined from "
+                "datastore_search_sql alone. For counting questions, do "
+                f"NOT report {n_returned} as the answer — instead run a "
+                "separate SELECT COUNT(*) with the same WHERE clause, or "
+                "use ckan__aggregate_data with metrics="
+                '{"count": "count(*)"}.\n'
+                "========================"
+            )
+
+        if not records:
+            text = "No records found matching the SQL query."
+            return f"{truncation_block}\n\n{text}" if truncation_block else text
+
+        lines: List[str] = []
+        if truncation_block:
+            lines.append(truncation_block)
+            lines.append("")
+
+        # Header — total is unknown for raw SQL, so show "X rows returned".
+        if effective_limit is not None:
+            lines.append(
+                f"{n_returned} rows returned (limit={effective_limit}, "
+                "true total unknown — see warning above if any).\n"
+            )
+        else:
+            lines.append(f"{n_returned} rows returned.\n")
 
         # Show field names if available
         if fields:
@@ -763,7 +1978,7 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                     lines.append(f"  {key}: {value}")
             lines.append("")
 
-        if len(records) > 10:
-            lines.append(f"... and {len(records) - 10} more record(s)")
+        if n_returned > 10:
+            lines.append(f"... and {n_returned - 10} more record(s) returned")
 
         return "\n".join(lines)

@@ -74,6 +74,50 @@ MCP Inspector is a web-based tool for testing MCP servers.
 
 ---
 
+## Method 4: Claude Desktop / Claude Code via `stdio_bridge.py`
+
+Claude Desktop and Claude Code speak MCP over stdio, not HTTP. `stdio_bridge.py` is a small Python adapter that reads JSON-RPC from stdin, forwards it to the local HTTP server, and writes responses back to stdout — a dependency-free replacement for the Go client in `client/` for cases where you just want a local stdio connection.
+
+Start the local server first (`python local_server.py` from the repo root — this entry point accepts both `/` and `/mcp`), then register the bridge as an MCP server.
+
+**Claude Desktop** — edit `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "boston-opendata": {
+      "command": "python",
+      "args": [
+        "C:/projects/boston/OpenContext/stdio_bridge.py",
+        "http://localhost:8000/mcp"
+      ]
+    }
+  }
+}
+```
+
+**Claude Code** — add an `.mcp.json` at the project root (or under `.claude/`):
+
+```json
+{
+  "mcpServers": {
+    "boston-opendata": {
+      "command": "python",
+      "args": [
+        "C:/projects/boston/OpenContext/stdio_bridge.py",
+        "http://localhost:8000/mcp"
+      ]
+    }
+  }
+}
+```
+
+The URL argument is optional — it defaults to `http://localhost:8000/mcp`. Pass a different URL to point at a deployed endpoint instead of the local server.
+
+Adjust the interpreter path (e.g. `C:/projects/boston/OpenContext/venv/Scripts/python.exe`) if you want to pin to a specific virtualenv. `stdio_bridge.py` uses only Python stdlib, so no extra installs are required.
+
+---
+
 ## Quick Checks
 
 Optional checks before starting the server.

@@ -1,13 +1,6 @@
 terraform {
   required_version = ">= 1.0"
 
-  backend "s3" {
-    bucket  = "opencontext-terraform-state"
-    key     = "opencontext/terraform.tfstate"
-    region  = "us-east-1"
-    encrypt = true
-  }
-
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -80,6 +73,8 @@ resource "aws_lambda_function" "mcp_server" {
   runtime          = "python3.11"
   memory_size      = local.lambda_memory
   timeout          = local.lambda_timeout
+
+  reserved_concurrent_executions = var.lambda_reserved_concurrency
 
   environment {
     variables = {
