@@ -1290,19 +1290,25 @@ class CKANPlugin(DataPlugin):
             lines.append(
                 "Other matching datasets (pass dataset_index=N to switch):"
             )
+            chosen_dataset_id = dataset.get("id")
             for i, alt in enumerate(alternates):
-                if i == 0:
-                    continue  # the chosen one
+                if alt.get("id") == chosen_dataset_id:
+                    continue  # skip the dataset we already returned rows for
                 alt_title = alt.get("title", "Untitled")
                 alt_id = alt.get("id", "unknown")
-                alt_resources = alt.get("resources") or []
-                alt_resource_id = (
-                    alt_resources[0].get("id") if alt_resources else None
-                )
+                alt_queryable = self._first_queryable_resource(alt)
                 lines.append(f"  [dataset_index={i}] {alt_title}")
                 lines.append(f"    dataset_id: {alt_id}")
-                if alt_resource_id:
-                    lines.append(f"    resource_id: {alt_resource_id}")
+                if alt_queryable:
+                    lines.append(
+                        f"    resource_id (queryable): "
+                        f"{alt_queryable.get('id')}"
+                    )
+                else:
+                    lines.append(
+                        "    (no datastore-loaded resource — "
+                        "download-only)"
+                    )
 
         return "\n".join(lines)
 
