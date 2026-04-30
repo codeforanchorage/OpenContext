@@ -653,6 +653,128 @@ class TestSafeSQLBuilderFilter:
             SafeSQLBuilder.build_filter_condition("name", ["list"])
 
 
+class TestSafeSQLBuilderWhereClause:
+    def test_empty_returns_empty_string(self):
+        assert SafeSQLBuilder.build_where_clause(None) == ""
+        assert SafeSQLBuilder.build_where_clause({}) == ""
+
+    def test_scalar_shorthand_equality(self):
+        got = SafeSQLBuilder.build_where_clause({"status": "Closed"})
+        assert got == "\"status\" = 'Closed'"
+
+    def test_scalar_none_is_null(self):
+        got = SafeSQLBuilder.build_where_clause({"close_date": None})
+        assert got == '"close_date" IS NULL'
+
+    def test_date_range(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"close_date": {"gte": "2026-04-29", "lt": "2026-04-30"}}
+        )
+        assert got == (
+            "\"close_date\" >= '2026-04-29' AND "
+            "\"close_date\" < '2026-04-30'"
+        )
+
+    def test_mixed_scalar_and_range(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {
+                "close_date": {"gte": "2026-04-29", "lt": "2026-04-30"},
+                "case_status": "Closed",
+            }
+        )
+        assert "\"case_status\" = 'Closed'" in got
+        assert "\"close_date\" >= '2026-04-29'" in got
+        assert "\"close_date\" < '2026-04-30'" in got
+        assert " AND " in got
+
+    def test_numeric_comparisons(self):
+        got = SafeSQLBuilder.build_where_clause({"count": {"gt": 5, "lte": 10}})
+        assert got == '"count" > 5 AND "count" <= 10'
+
+    def test_in_list_strings(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"neighborhood": {"in": ["Roxbury", "Dorchester"]}}
+        )
+        assert got == "\"neighborhood\" IN ('Roxbury', 'Dorchester')"
+
+    def test_not_in_list(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"status": {"not_in": ["Open", "Pending"]}}
+        )
+        assert got == "\"status\" NOT IN ('Open', 'Pending')"
+
+    def test_like_escaped(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"address": {"like": "%Beacon%"}}
+        )
+        assert got == "\"address\" LIKE '%Beacon%'"
+
+    def test_ilike(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"name": {"ilike": "boston%"}}
+        )
+        assert got == "\"name\" ILIKE 'boston%'"
+
+    def test_is_null_true(self):
+        got = SafeSQLBuilder.build_where_clause({"close_date": {"is_null": True}})
+        assert got == '"close_date" IS NULL'
+
+    def test_is_null_false(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"close_date": {"is_null": False}}
+        )
+        assert got == '"close_date" IS NOT NULL'
+
+    def test_quote_injection_in_string_value_escaped(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"name": {"eq": "x' OR 1=1--"}}
+        )
+        assert got == "\"name\" = 'x'' OR 1=1--'"
+
+    def test_quote_injection_in_in_list_escaped(self):
+        got = SafeSQLBuilder.build_where_clause(
+            {"name": {"in": ["a", "b' OR 1=1--"]}}
+        )
+        assert got == "\"name\" IN ('a', 'b'' OR 1=1--')"
+
+    def test_unknown_operator_rejected(self):
+        with pytest.raises(ValueError, match="Unknown operator"):
+            SafeSQLBuilder.build_where_clause({"x": {"regex": "."}})
+
+    def test_bad_field_rejected(self):
+        with pytest.raises(ValueError):
+            SafeSQLBuilder.build_where_clause({"x; DROP TABLE": 1})
+
+    def test_in_requires_list(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            SafeSQLBuilder.build_where_clause({"x": {"in": "single"}})
+
+    def test_in_rejects_empty_list(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            SafeSQLBuilder.build_where_clause({"x": {"in": []}})
+
+    def test_in_rejects_oversized_list(self):
+        with pytest.raises(ValueError, match="too long"):
+            SafeSQLBuilder.build_where_clause({"x": {"in": list(range(101))}})
+
+    def test_like_rejects_non_string(self):
+        with pytest.raises(ValueError, match="string pattern"):
+            SafeSQLBuilder.build_where_clause({"x": {"like": 5}})
+
+    def test_is_null_rejects_non_bool(self):
+        with pytest.raises(ValueError, match="bool"):
+            SafeSQLBuilder.build_where_clause({"x": {"is_null": "yes"}})
+
+    def test_overlong_string_rejected(self):
+        big = "a" * 1000
+        with pytest.raises(ValueError, match="too long"):
+            SafeSQLBuilder.build_where_clause({"x": {"eq": big}})
+
+    def test_non_dict_top_level_rejected(self):
+        with pytest.raises(ValueError, match="must be a dict"):
+            SafeSQLBuilder.build_where_clause(["x"])
+
+
 class TestSafeSQLBuilderOrderAndLimit:
     def test_order_by_plain(self):
         assert SafeSQLBuilder.validate_order_by("date") == '"date"'

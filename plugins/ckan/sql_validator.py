@@ -368,6 +368,143 @@ class SafeSQLBuilder:
             f"{type(value).__name__}"
         )
 
+    # Operator → SQL fragment for build_where_clause. Restricted to a known-
+    # safe set; arbitrary operators are rejected.
+    _COMPARISON_OPS = {
+        "eq": "=",
+        "ne": "!=",
+        "gt": ">",
+        "gte": ">=",
+        "lt": "<",
+        "lte": "<=",
+    }
+    _MAX_STRING_VALUE_LEN = 256
+    _MAX_IN_LIST_LEN = 100
+    ALLOWED_WHERE_OPS = (
+        "eq",
+        "ne",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "in",
+        "not_in",
+        "like",
+        "ilike",
+        "is_null",
+    )
+
+    @classmethod
+    def _format_scalar(cls, value: Any, op_label: str) -> str:
+        """Format a scalar as a SQL literal. Strings are single-quoted with
+        embedded quotes escaped; numbers and bools are inlined."""
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            if len(value) > cls._MAX_STRING_VALUE_LEN:
+                raise ValueError(
+                    f"value too long for {op_label!r}: "
+                    f"{len(value)} > {cls._MAX_STRING_VALUE_LEN}"
+                )
+            return "'" + value.replace("'", "''") + "'"
+        raise ValueError(
+            f"unsupported value type for {op_label!r}: "
+            f"{type(value).__name__}"
+        )
+
+    @classmethod
+    def build_where_clause(cls, where: Any) -> str:
+        """Build a parameter-validated SQL WHERE fragment from a structured
+        spec.
+
+        Accepted shapes per field:
+          - ``"col": <scalar>`` — equality (or ``IS NULL`` if ``None``).
+          - ``"col": {"op": value, ...}`` — one or more comparison clauses
+            ANDed together. Allowed ops:
+
+              ``eq``, ``ne``, ``gt``, ``gte``, ``lt``, ``lte``  — scalar value.
+              ``in``, ``not_in``                                — list of scalars.
+              ``like``, ``ilike``                               — string pattern.
+              ``is_null``                                       — bool.
+
+        Returns the WHERE fragment WITHOUT the leading ``WHERE`` (or ``""``
+        if ``where`` is empty/None). Raises ``ValueError`` on any disallowed
+        operator, identifier, or value.
+        """
+        if where in (None, {}):
+            return ""
+        if not isinstance(where, dict):
+            raise ValueError(
+                f"where must be a dict, got: {type(where).__name__}"
+            )
+
+        parts: List[str] = []
+        for field, spec in where.items():
+            quoted = SafeSQLBuilder.quote_identifier(field)
+            if not isinstance(spec, dict):
+                # Scalar shorthand → equality / IS NULL.
+                parts.append(SafeSQLBuilder.build_filter_condition(field, spec))
+                continue
+            if not spec:
+                raise ValueError(
+                    f"empty operator dict for field {field!r}"
+                )
+            for op, val in spec.items():
+                if not isinstance(op, str):
+                    raise ValueError(
+                        f"operator must be a string for {field!r}: {op!r}"
+                    )
+                op_lower = op.lower()
+                if op_lower in cls._COMPARISON_OPS:
+                    sql_op = cls._COMPARISON_OPS[op_lower]
+                    parts.append(
+                        f"{quoted} {sql_op} {cls._format_scalar(val, op_lower)}"
+                    )
+                elif op_lower in ("in", "not_in"):
+                    if not isinstance(val, list) or not val:
+                        raise ValueError(
+                            f"{op_lower!r} requires a non-empty list for "
+                            f"{field!r}, got: {val!r}"
+                        )
+                    if len(val) > cls._MAX_IN_LIST_LEN:
+                        raise ValueError(
+                            f"{op_lower!r} list too long for {field!r}: "
+                            f"{len(val)} > {cls._MAX_IN_LIST_LEN}"
+                        )
+                    items = ", ".join(
+                        cls._format_scalar(v, op_lower) for v in val
+                    )
+                    sql_kw = "IN" if op_lower == "in" else "NOT IN"
+                    parts.append(f"{quoted} {sql_kw} ({items})")
+                elif op_lower in ("like", "ilike"):
+                    if not isinstance(val, str):
+                        raise ValueError(
+                            f"{op_lower!r} requires a string pattern for "
+                            f"{field!r}, got: {val!r}"
+                        )
+                    parts.append(
+                        f"{quoted} {op_lower.upper()} "
+                        f"{cls._format_scalar(val, op_lower)}"
+                    )
+                elif op_lower == "is_null":
+                    if not isinstance(val, bool):
+                        raise ValueError(
+                            f"'is_null' requires a bool for {field!r}, "
+                            f"got: {val!r}"
+                        )
+                    parts.append(
+                        f"{quoted} {'IS NULL' if val else 'IS NOT NULL'}"
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown operator {op!r} for field {field!r}. "
+                        f"Allowed: {', '.join(cls.ALLOWED_WHERE_OPS)}"
+                    )
+
+        return " AND ".join(parts)
+
     @staticmethod
     def validate_order_by(order_by: Any) -> str:
         """Validate an ``ORDER BY`` clause: ``<identifier> [ASC|DESC]``."""

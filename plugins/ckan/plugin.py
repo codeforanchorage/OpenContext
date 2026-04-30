@@ -4,7 +4,7 @@ This plugin provides access to CKAN-based open data portals.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from tenacity import (
@@ -202,7 +202,13 @@ class CKANPlugin(DataPlugin):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Free-text search keywords (e.g. '311 service requests', 'building permits').",
+                            "description": (
+                                "Free-text keywords matched against "
+                                "DATASET METADATA (title/tags/desc), NOT "
+                                "row content. Use the row-returning "
+                                "tools' `where` argument to filter ROWS. "
+                                "Examples: '311', 'parks'."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
@@ -259,6 +265,24 @@ class CKANPlugin(DataPlugin):
                     "`ckan__search_datasets` and `ckan__get_dataset` "
                     "labels resources as QUERYABLE or DOWNLOAD-ONLY — pick "
                     "the QUERYABLE one.\n\n"
+                    "FILTERING — pick the right knob:\n"
+                    "  - `filters` is EQUALITY ONLY (case_status='Closed'). "
+                    "Cannot do dates, ranges, BETWEEN, IN, LIKE, or any "
+                    "comparison. A timestamp column will NEVER match an "
+                    "equality filter on a date string like '2026-04-29'.\n"
+                    "  - `where` is structured comparison. Use this for "
+                    "date ranges, numeric bounds, IN-lists, LIKE/ILIKE, "
+                    "or NULL checks. Example for 'closed on 2026-04-29':\n"
+                    "    where = {\"close_date\": {\"gte\": "
+                    "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                    "\"case_status\": \"Closed\"}\n"
+                    "  - For window functions, CTEs, joins, or anything "
+                    "the structured `where` can't express, use "
+                    "`ckan__execute_sql` instead.\n\n"
+                    "Note: `query` arguments on search tools match dataset "
+                    "metadata (titles/tags), NOT row content. To filter "
+                    "ROWS by date/status/etc., use `where` here or in "
+                    "`ckan__search_and_query`.\n\n"
                     "Tip: if you only have a keyword and no resource_id "
                     "yet, use `ckan__search_and_query` instead — it does "
                     "the lookup and the data fetch in a single call and "
@@ -280,7 +304,30 @@ class CKANPlugin(DataPlugin):
                         },
                         "filters": {
                             "type": "object",
-                            "description": "Optional filters as field:value pairs (e.g. {\"status\": \"Open\"}).",
+                            "description": (
+                                "EQUALITY-ONLY filters as field:value "
+                                "pairs (e.g. {\"status\": \"Open\"}). For "
+                                "ranges/dates/IN/LIKE, use `where` "
+                                "instead — `filters` cannot express "
+                                "anything other than exact equality."
+                            ),
+                        },
+                        "where": {
+                            "type": "object",
+                            "description": (
+                                "Structured WHERE clause supporting "
+                                "comparison operators. Each entry is "
+                                "either {field: scalar} (equality) or "
+                                "{field: {op: value, ...}} where op is "
+                                "one of: eq, ne, gt, gte, lt, lte, in, "
+                                "not_in, like, ilike, is_null. Example "
+                                "for 'closed on 2026-04-29': "
+                                "{\"close_date\": {\"gte\": "
+                                "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                                "\"case_status\": \"Closed\"}. The "
+                                "schema footer in any prior query result "
+                                "lists available column names and types."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
@@ -325,19 +372,33 @@ class CKANPlugin(DataPlugin):
                 description=(
                     f"Execute a raw PostgreSQL SELECT query against "
                     f"{city}'s CKAN datastore.\n\n"
-                    "⚠️ Advanced users only. For complex queries requiring "
-                    "full SQL.\n\n"
+                    "⚠️ Use this only when the structured `where` "
+                    "argument on `ckan__query_data` / "
+                    "`ckan__search_and_query` cannot express your filter "
+                    "(e.g. window functions, CTEs, joins, aggregations "
+                    "beyond ckan__aggregate_data).\n\n"
                     "Security: Only SELECT allowed. INSERT/UPDATE/DELETE "
                     "blocked.\n\n"
-                    "Examples:\n"
+                    "Concrete examples:\n"
+                    "- Closed on a specific date:\n"
+                    "    SELECT * FROM \"<resource_id>\" WHERE "
+                    "close_date >= '2026-04-29' AND close_date < "
+                    "'2026-04-30' AND case_status = 'Closed' LIMIT 100\n"
+                    "- Counts by day:\n"
+                    "    SELECT date_trunc('day', close_date) AS d, "
+                    "COUNT(*) FROM \"<resource_id>\" GROUP BY d "
+                    "ORDER BY d DESC LIMIT 30\n"
                     "- Window functions: RANK() OVER (...)\n"
-                    "- CTEs: WITH subquery AS (...)\n"
-                    "- Complex aggregations: PERCENTILE_CONT(0.5) WITHIN GROUP\n\n"
-                    "Resource IDs must be double-quoted: FROM \"uuid-here\"\n\n"
+                    "- CTEs: WITH subquery AS (...)\n\n"
+                    "Resource IDs must be double-quoted: "
+                    "FROM \"uuid-here\"\n\n"
                     "Prerequisites:\n"
                     "  - resource UUID for the FROM clause: get from "
                     "`ckan__search_datasets` or `ckan__get_dataset`.\n"
-                    "  - field names: get from `ckan__get_schema`."
+                    "  - field names: get from `ckan__get_schema`, or "
+                    "the 'Filterable columns' footer of any prior "
+                    "successful `ckan__query_data` / "
+                    "`ckan__search_and_query` call."
                 ),
                 input_schema={
                     "type": "object",
@@ -418,17 +479,34 @@ class CKANPlugin(DataPlugin):
                     "search results and skips datasets / resources that "
                     "aren't datastore-active, so you don't get a 404 "
                     "from a download-only resource.\n\n"
+                    "WHAT `query` MEANS: `query` matches dataset metadata "
+                    "(title, tags, description) — it does NOT filter ROWS. "
+                    "If the user asks for '311 requests closed on 4/29', "
+                    "the `query` finds the 311 dataset and `where` does "
+                    "the row filtering:\n"
+                    "  query=\"311\", where={\"close_date\": {\"gte\": "
+                    "\"2026-04-29\", \"lt\": \"2026-04-30\"}, "
+                    "\"case_status\": \"Closed\"}\n\n"
                     "Returns: data rows from the chosen dataset's chosen "
-                    "resource, plus a header showing which dataset and "
-                    "resource were used so you can drill deeper with "
-                    "`ckan__query_data` or `ckan__get_dataset` if needed."
+                    "resource, plus a 'Filterable columns' footer listing "
+                    "the schema (so you can refine with `where` or pivot "
+                    "to `ckan__execute_sql` for joins/CTEs/window funcs), "
+                    "plus a header showing which dataset and resource "
+                    "were used."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Free-text search keywords (e.g. '311 service requests').",
+                            "description": (
+                                "Free-text keywords matched against "
+                                "DATASET METADATA (title/tags/desc), NOT "
+                                "row content. Use `where` (or "
+                                "`ckan__execute_sql`) to filter ROWS by "
+                                "date/status/etc. Examples: '311', "
+                                "'parks', 'building permits'."
+                            ),
                         },
                         "limit": {
                             "type": "integer",
@@ -437,7 +515,26 @@ class CKANPlugin(DataPlugin):
                         },
                         "filters": {
                             "type": "object",
-                            "description": "Optional row-level filters as field:value pairs, applied to the matched resource.",
+                            "description": (
+                                "EQUALITY-ONLY row filters (e.g. "
+                                "{\"case_status\": \"Closed\"}). For "
+                                "ranges/dates/IN/LIKE, use `where` "
+                                "instead."
+                            ),
+                        },
+                        "where": {
+                            "type": "object",
+                            "description": (
+                                "Structured WHERE clause for ranges, "
+                                "dates, IN, LIKE, NULL checks. Each "
+                                "entry is {field: scalar} (equality) or "
+                                "{field: {op: value, ...}} where op is "
+                                "one of: eq, ne, gt, gte, lt, lte, in, "
+                                "not_in, like, ilike, is_null. The "
+                                "right knob for 'closed on 2026-04-29': "
+                                "{\"close_date\": {\"gte\": "
+                                "\"2026-04-29\", \"lt\": \"2026-04-30\"}}."
+                            ),
                         },
                         "dataset_index": {
                             "type": "integer",
@@ -518,14 +615,28 @@ class CKANPlugin(DataPlugin):
                         success=False,
                         error_message="resource_id is required",
                     )
-                filters = arguments.get("filters", {})
+                filters = arguments.get("filters") or {}
+                where = arguments.get("where") or None
                 limit = arguments.get("limit", 100)
-                data = await self.query_data(resource_id, filters, limit)
+                records, fields, error = await self._query_with_schema(
+                    resource_id=resource_id,
+                    filters=filters,
+                    limit=limit,
+                    where=where,
+                )
+                if error:
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message=error,
+                    )
                 return ToolResult(
                     content=[
                         {
                             "type": "text",
-                            "text": self._format_query_results(data, limit),
+                            "text": self._format_query_results(
+                                records, fields, limit
+                            ),
                         }
                     ],
                     success=True,
@@ -584,12 +695,14 @@ class CKANPlugin(DataPlugin):
                     )
                 limit = arguments.get("limit", 100)
                 filters = arguments.get("filters") or {}
+                where = arguments.get("where") or None
                 dataset_index = arguments.get("dataset_index")
                 resource_index = arguments.get("resource_index")
                 composite = await self.search_and_query(
                     query=query,
                     limit=limit,
                     filters=filters,
+                    where=where,
                     dataset_index=dataset_index,
                     resource_index=resource_index,
                 )
@@ -697,17 +810,81 @@ class CKANPlugin(DataPlugin):
         resource_id: str,
         filters: Optional[Dict[str, Any]] = None,
         limit: int = 100,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Query data from a specific resource.
 
         Args:
             resource_id: Resource ID
-            filters: Optional filters (field: value pairs)
+            filters: Equality-only filters (field: value) passed to
+                CKAN's datastore_search
             limit: Maximum number of records
+            where: Structured WHERE spec supporting comparison operators
+                (gt/gte/lt/lte/in/not_in/like/ilike/is_null). When set,
+                routes through datastore_search_sql for a real WHERE clause.
 
         Returns:
-            List of data records
+            List of data records (the schema-aware variant is
+            ``_query_with_schema``).
         """
+        records, _fields, error = await self._query_with_schema(
+            resource_id=resource_id,
+            filters=filters,
+            limit=limit,
+            where=where,
+        )
+        if error:
+            raise RuntimeError(error)
+        return records
+
+    async def _query_with_schema(
+        self,
+        resource_id: str,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 100,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
+        """Query datastore and return (records, fields, error_message).
+
+        Routes through datastore_search_sql when ``where`` is set so the
+        caller can express ranges/IN/LIKE; otherwise falls back to the
+        cheaper datastore_search equality path.
+        """
+        if where:
+            try:
+                validated_id = SafeSQLBuilder.validate_resource_id(resource_id)
+                where_sql = SafeSQLBuilder.build_where_clause(where)
+                limit_int = SafeSQLBuilder.clamp_limit(limit)
+            except ValueError as e:
+                return [], [], str(e)
+
+            sql_parts = [f'SELECT * FROM "{validated_id}"']
+            if where_sql:
+                sql_parts.append(f" WHERE {where_sql}")
+            if filters:
+                # Equality filters can ride alongside `where` clauses.
+                try:
+                    eq_conds = [
+                        SafeSQLBuilder.build_filter_condition(f, v)
+                        for f, v in filters.items()
+                    ]
+                except ValueError as e:
+                    return [], [], str(e)
+                joiner = " AND " if where_sql else " WHERE "
+                sql_parts.append(joiner + " AND ".join(eq_conds))
+            sql_parts.append(f" LIMIT {limit_int}")
+            sql = "".join(sql_parts)
+
+            result = await self.execute_sql(sql)
+            if result.get("error"):
+                return [], [], result.get("message", "SQL execution failed")
+            return (
+                result.get("records", []),
+                result.get("fields", []),
+                None,
+            )
+
+        # No `where` → cheap datastore_search path.
         params: Dict[str, Any] = {"resource_id": resource_id, "limit": limit}
         if filters:
             params["filters"] = filters
@@ -716,12 +893,10 @@ class CKANPlugin(DataPlugin):
             response = await self._call_ckan_api("datastore_search", params)
         except RuntimeError as e:
             msg = str(e)
-            # 404 from datastore_search almost always means the resource UUID
-            # is real but isn't loaded into the queryable Postgres datastore
-            # (datastore_active=false). Surface that explicitly so callers
-            # don't keep retrying with the same UUID.
             if "404" in msg or "not found" in msg.lower():
-                raise RuntimeError(
+                return (
+                    [],
+                    [],
                     f"{msg}\n"
                     "Hint: this resource may exist as a file download "
                     "(GeoJSON/KML/SHP/PDF) but not be loaded into the "
@@ -729,10 +904,16 @@ class CKANPlugin(DataPlugin):
                     "ckan__get_dataset on the parent dataset to find a "
                     "QUERYABLE resource (typically the CSV one), or use "
                     "ckan__search_and_query, which auto-picks the "
-                    "datastore-loaded resource."
-                ) from e
-            raise
-        return response.get("result", {}).get("records", [])
+                    "datastore-loaded resource.",
+                )
+            return [], [], msg
+
+        result = response.get("result", {})
+        return (
+            result.get("records", []),
+            result.get("fields", []),
+            None,
+        )
 
     async def get_schema(self, resource_id: str) -> Dict[str, Any]:
         """Get schema information for a resource.
@@ -869,6 +1050,7 @@ class CKANPlugin(DataPlugin):
         query: str,
         limit: int = 100,
         filters: Optional[Dict[str, Any]] = None,
+        where: Optional[Dict[str, Any]] = None,
         dataset_index: Optional[int] = None,
         resource_index: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -998,18 +1180,18 @@ class CKANPlugin(DataPlugin):
                 ),
             }
 
-        try:
-            records = await self.query_data(
-                resource_id=resource_id,
-                filters=filters or None,
-                limit=limit,
-            )
-        except Exception as e:
+        records, fields, error = await self._query_with_schema(
+            resource_id=resource_id,
+            filters=filters or None,
+            where=where,
+            limit=limit,
+        )
+        if error:
             return {
                 "error": True,
                 "message": (
                     f"Found dataset {chosen_dataset.get('id')!r} resource "
-                    f"{resource_id!r} but query_data failed: {e}"
+                    f"{resource_id!r} but query_data failed: {error}"
                 ),
             }
 
@@ -1017,6 +1199,7 @@ class CKANPlugin(DataPlugin):
             "dataset": chosen_dataset,
             "resource": chosen_resource,
             "records": records,
+            "fields": fields,
             "alternate_datasets": datasets,
         }
 
@@ -1206,10 +1389,17 @@ class CKANPlugin(DataPlugin):
 
         return "\n".join(lines)
 
-    def _format_query_results(self, records: List[Dict[str, Any]], limit: int) -> str:
+    def _format_query_results(
+        self,
+        records: List[Dict[str, Any]],
+        fields: Optional[List[Dict[str, Any]]] = None,
+        limit: int = 100,
+    ) -> str:
         """Format query results for user display."""
         if not records:
-            return "No records found matching the query."
+            text = "No records found matching the query."
+            schema_footer = self._format_schema_footer(fields)
+            return f"{text}\n\n{schema_footer}" if schema_footer else text
 
         lines = [f"Found {len(records)} record(s) (showing up to {limit}):\n"]
 
@@ -1224,6 +1414,37 @@ class CKANPlugin(DataPlugin):
         if len(records) > 5:
             lines.append(f"... and {len(records) - 5} more record(s)")
 
+        schema_footer = self._format_schema_footer(fields)
+        if schema_footer:
+            lines.append("")
+            lines.append(schema_footer)
+
+        return "\n".join(lines)
+
+    def _format_schema_footer(
+        self, fields: Optional[List[Dict[str, Any]]]
+    ) -> str:
+        """Render a per-call 'Filterable columns' block listing every field
+        the model can pass to ``where``, ``filters``, or reference in
+        ``execute_sql``.
+
+        We surface this on every successful row-returning call so the next
+        pivot (e.g. 'now filter by close_date') is a one-shot."""
+        if not fields:
+            return ""
+        usable = [
+            f for f in fields if f.get("id") and f.get("id") != "_id"
+        ]
+        if not usable:
+            return ""
+        lines = [
+            "Filterable columns (use these names in `where`, `filters`, "
+            "or `execute_sql`):"
+        ]
+        for f in usable:
+            fid = f.get("id")
+            ftype = f.get("type", "?")
+            lines.append(f"  - {fid} ({ftype})")
         return "\n".join(lines)
 
     def _format_schema(self, fields: List[Dict[str, Any]]) -> str:
@@ -1251,6 +1472,7 @@ class CKANPlugin(DataPlugin):
         dataset = composite.get("dataset", {}) or {}
         resource = composite.get("resource", {}) or {}
         records = composite.get("records", []) or []
+        fields = composite.get("fields", []) or []
         alternates = composite.get("alternate_datasets", []) or []
 
         dataset_id = dataset.get("id", "unknown")
@@ -1284,6 +1506,11 @@ class CKANPlugin(DataPlugin):
                 lines.append("")
             if len(records) > 5:
                 lines.append(f"... and {len(records) - 5} more record(s)")
+
+        schema_footer = self._format_schema_footer(fields)
+        if schema_footer:
+            lines.append("")
+            lines.append(schema_footer)
 
         if len(alternates) > 1:
             lines.append("")

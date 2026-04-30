@@ -818,6 +818,143 @@ class TestExecuteTool:
             assert "Has CSV" in text
 
     @pytest.mark.asyncio
+    async def test_execute_tool_query_data_with_where_uses_sql_endpoint(
+        self, ckan_config
+    ):
+        """When `where` is supplied, query_data must route through
+        datastore_search_sql with a built WHERE clause — not through
+        datastore_search (equality-only)."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_sql = Mock()
+            mock_response_sql.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "case_id": "BCS-1", "case_status": "Closed"}
+                    ],
+                    "fields": [
+                        {"id": "case_id", "type": "text"},
+                        {"id": "close_date", "type": "timestamp"},
+                        {"id": "case_status", "type": "text"},
+                    ],
+                }
+            }
+            mock_response_sql.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_sql]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {
+                        "close_date": {
+                            "gte": "2026-04-29",
+                            "lt": "2026-04-30",
+                        },
+                        "case_status": "Closed",
+                    },
+                    "limit": 5,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "BCS-1" in text
+            # Schema footer surfaces filterable columns
+            assert "Filterable columns" in text
+            assert "close_date" in text
+            # Verify the second POST hit datastore_search_sql with a SQL
+            # body containing the expected WHERE clause.
+            second_call = mock_client.post.call_args_list[1]
+            assert second_call[0][0] == "/api/3/action/datastore_search_sql"
+            sql = second_call[1]["json"]["sql"]
+            assert (
+                'FROM "11111111-2222-3333-4444-555555555555"' in sql
+            )
+            assert '"close_date" >= \'2026-04-29\'' in sql
+            assert '"close_date" < \'2026-04-30\'' in sql
+            assert '"case_status" = \'Closed\'' in sql
+            assert "LIMIT 5" in sql
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_query_data_where_validation_error_surfaces(
+        self, ckan_config
+    ):
+        """A bad `where` operator returns a clean error — no API call."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_client.post = AsyncMock(return_value=mock_response_init)
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {"col": {"regex": "."}},
+                },
+            )
+
+            assert result.success is False
+            assert "Unknown operator" in (result.error_message or "")
+            # Only the init POST should have happened — no SQL call.
+            assert mock_client.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_query_data_schema_footer_in_normal_path(
+        self, ckan_config
+    ):
+        """The non-SQL (no `where`) path also returns the schema footer."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "x": "y"}],
+                    "fields": [
+                        {"id": "x", "type": "text"},
+                        {"id": "z", "type": "int"},
+                    ],
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_query]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "Filterable columns" in text
+            assert "x (text)" in text
+            assert "z (int)" in text
+
+    @pytest.mark.asyncio
     async def test_query_data_404_includes_datastore_active_hint(self, ckan_config):
         """A 404 from query_data should append the datastore_active hint."""
         plugin = CKANPlugin(ckan_config)
