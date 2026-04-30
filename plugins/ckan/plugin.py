@@ -651,7 +651,7 @@ class CKANPlugin(DataPlugin):
                 filters = arguments.get("filters") or {}
                 where = arguments.get("where") or None
                 limit = arguments.get("limit", 100)
-                records, fields, error = await self._query_with_schema(
+                records, fields, total, error = await self._query_with_schema(
                     resource_id=resource_id,
                     filters=filters,
                     limit=limit,
@@ -668,7 +668,7 @@ class CKANPlugin(DataPlugin):
                         {
                             "type": "text",
                             "text": self._format_query_results(
-                                records, fields, limit
+                                records, fields, limit, total
                             ),
                         }
                     ],
@@ -862,7 +862,7 @@ class CKANPlugin(DataPlugin):
             List of data records (the schema-aware variant is
             ``_query_with_schema``).
         """
-        records, _fields, error = await self._query_with_schema(
+        records, _fields, _total, error = await self._query_with_schema(
             resource_id=resource_id,
             filters=filters,
             limit=limit,
@@ -872,14 +872,66 @@ class CKANPlugin(DataPlugin):
             raise RuntimeError(error)
         return records
 
+    async def _count_via_sql(
+        self,
+        resource_id: str,
+        where_sql: str,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Run a SELECT COUNT(*) with the same filters to discover the true
+        row total when a SELECT * hit the limit.
+
+        Returns ``None`` if the count call itself fails (we'd rather show
+        a 'TRUNCATED' warning than block the data response on a failed
+        count). Returns the integer total on success.
+        """
+        try:
+            sql_parts = [f'SELECT COUNT(*) AS n FROM "{resource_id}"']
+            if where_sql:
+                sql_parts.append(f" WHERE {where_sql}")
+            if filters:
+                eq_conds = [
+                    SafeSQLBuilder.build_filter_condition(f, v)
+                    for f, v in filters.items()
+                ]
+                joiner = " AND " if where_sql else " WHERE "
+                sql_parts.append(joiner + " AND ".join(eq_conds))
+            sql = "".join(sql_parts)
+            result = await self.execute_sql(sql)
+            if result.get("error"):
+                return None
+            recs = result.get("records") or []
+            if not recs:
+                return None
+            n = recs[0].get("n") or recs[0].get("count")
+            if n is None:
+                return None
+            try:
+                return int(n)
+            except (TypeError, ValueError):
+                return None
+        except Exception:
+            return None
+
     async def _query_with_schema(
         self,
         resource_id: str,
         filters: Optional[Dict[str, Any]] = None,
         limit: int = 100,
         where: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
-        """Query datastore and return (records, fields, error_message).
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Optional[int],
+        Optional[str],
+    ]:
+        """Query datastore and return (records, fields, total, error).
+
+        ``total`` is the true number of rows matching the filter, regardless
+        of LIMIT. CKAN's datastore_search returns this for free; for the
+        SQL (``where``) path we issue a follow-up COUNT(*) only when the
+        result hit the limit (otherwise len(records) IS the total).
+        Returns ``None`` when we couldn't determine a total.
 
         Routes through datastore_search_sql when ``where`` is set so the
         caller can express ranges/IN/LIKE; otherwise falls back to the
@@ -891,7 +943,7 @@ class CKANPlugin(DataPlugin):
                 where_sql = SafeSQLBuilder.build_where_clause(where)
                 limit_int = SafeSQLBuilder.clamp_limit(limit)
             except ValueError as e:
-                return [], [], str(e)
+                return [], [], None, str(e)
 
             sql_parts = [f'SELECT * FROM "{validated_id}"']
             if where_sql:
@@ -904,7 +956,7 @@ class CKANPlugin(DataPlugin):
                         for f, v in filters.items()
                     ]
                 except ValueError as e:
-                    return [], [], str(e)
+                    return [], [], None, str(e)
                 joiner = " AND " if where_sql else " WHERE "
                 sql_parts.append(joiner + " AND ".join(eq_conds))
             sql_parts.append(f" LIMIT {limit_int}")
@@ -912,12 +964,24 @@ class CKANPlugin(DataPlugin):
 
             result = await self.execute_sql(sql)
             if result.get("error"):
-                return [], [], result.get("message", "SQL execution failed")
-            return (
-                result.get("records", []),
-                result.get("fields", []),
-                None,
-            )
+                return [], [], None, result.get(
+                    "message", "SQL execution failed"
+                )
+            records = result.get("records", [])
+            fields = result.get("fields", [])
+
+            # If we hit the LIMIT exactly, we don't actually know the total —
+            # do a cheap COUNT(*) follow-up so the model gets a real number
+            # instead of mistaking the limit for the count.
+            total: Optional[int]
+            if len(records) >= limit_int:
+                total = await self._count_via_sql(
+                    validated_id, where_sql, filters
+                )
+            else:
+                total = len(records)
+
+            return records, fields, total, None
 
         # No `where` → cheap datastore_search path.
         params: Dict[str, Any] = {"resource_id": resource_id, "limit": limit}
@@ -932,6 +996,7 @@ class CKANPlugin(DataPlugin):
                 return (
                     [],
                     [],
+                    None,
                     f"{msg}\n"
                     "Hint: this resource may exist as a file download "
                     "(GeoJSON/KML/SHP/PDF) but not be loaded into the "
@@ -941,12 +1006,20 @@ class CKANPlugin(DataPlugin):
                     "ckan__search_and_query, which auto-picks the "
                     "datastore-loaded resource.",
                 )
-            return [], [], msg
+            return [], [], None, msg
 
         result = response.get("result", {})
+        # CKAN returns `total` for free here — a true count of rows
+        # matching the filter, not capped by limit.
+        total_val = result.get("total")
+        try:
+            total = int(total_val) if total_val is not None else None
+        except (TypeError, ValueError):
+            total = None
         return (
             result.get("records", []),
             result.get("fields", []),
+            total,
             None,
         )
 
@@ -1294,7 +1367,7 @@ class CKANPlugin(DataPlugin):
                 ),
             }
 
-        records, fields, error = await self._query_with_schema(
+        records, fields, total, error = await self._query_with_schema(
             resource_id=resource_id,
             filters=filters or None,
             where=where,
@@ -1314,6 +1387,7 @@ class CKANPlugin(DataPlugin):
             "resource": chosen_resource,
             "records": records,
             "fields": fields,
+            "total": total,
             "alternate_datasets": datasets,
         }
 
@@ -1508,14 +1582,44 @@ class CKANPlugin(DataPlugin):
         records: List[Dict[str, Any]],
         fields: Optional[List[Dict[str, Any]]] = None,
         limit: int = 100,
+        total: Optional[int] = None,
     ) -> str:
         """Format query results for user display."""
+        n_returned = len(records)
+        truncated_warning = self._format_truncation_block(
+            n_returned, limit, total
+        )
+
         if not records:
             text = "No records found matching the query."
+            parts = [truncated_warning, text] if truncated_warning else [text]
             schema_footer = self._format_schema_footer(fields)
-            return f"{text}\n\n{schema_footer}" if schema_footer else text
+            if schema_footer:
+                parts.append("")
+                parts.append(schema_footer)
+            return "\n".join(parts)
 
-        lines = [f"Found {len(records)} record(s) (showing up to {limit}):\n"]
+        lines: List[str] = []
+        if truncated_warning:
+            lines.append(truncated_warning)
+            lines.append("")
+
+        # Header line: prefer "true total" wording when known, since the
+        # model has consistently been mistaking len(records) for the total.
+        if total is not None and total != n_returned:
+            lines.append(
+                f"total_matching_rows: {total} (returned {n_returned}, "
+                f"limit={limit})\n"
+            )
+        elif total is not None:
+            lines.append(
+                f"total_matching_rows: {total} (limit={limit})\n"
+            )
+        else:
+            lines.append(
+                f"returned_rows: {n_returned} (limit={limit}, "
+                "total unknown — see warning above if any)\n"
+            )
 
         # Show first few records as examples
         for i, record in enumerate(records[:5], 1):
@@ -1525,8 +1629,8 @@ class CKANPlugin(DataPlugin):
                     lines.append(f"  {key}: {value}")
             lines.append("")
 
-        if len(records) > 5:
-            lines.append(f"... and {len(records) - 5} more record(s)")
+        if n_returned > 5:
+            lines.append(f"... and {n_returned - 5} more record(s) returned")
 
         schema_footer = self._format_schema_footer(fields)
         if schema_footer:
@@ -1534,6 +1638,53 @@ class CKANPlugin(DataPlugin):
             lines.append(schema_footer)
 
         return "\n".join(lines)
+
+    def _format_truncation_block(
+        self,
+        n_returned: int,
+        limit: int,
+        total: Optional[int],
+    ) -> str:
+        """Emit a clear warning when the result set is — or might be —
+        truncated by LIMIT.
+
+        Returns ``""`` when no warning is needed (result fits within limit
+        and total is known/equal to returned)."""
+        # Total known and matches returned → fits within limit, no warning.
+        if total is not None and total <= n_returned:
+            return ""
+
+        # Total known but exceeds returned → exact truncation, exact total.
+        if total is not None and total > n_returned:
+            return (
+                "=== TRUNCATED ===\n"
+                f"This query has {total} matching rows, but only "
+                f"{n_returned} were returned (limit={limit}). For "
+                "counting questions, the answer is "
+                f"{total}, NOT {n_returned}. To return more rows, raise "
+                "`limit` (max 10000) or use `ckan__execute_sql` with "
+                "your own LIMIT/ORDER BY. For just the count, use "
+                "ckan__aggregate_data with metrics="
+                '{"count": "count(*)"} and a matching filter — '
+                "it's cheaper than fetching rows.\n"
+                "================="
+            )
+
+        # Total unknown and we hit the limit exactly → likely truncated.
+        if total is None and n_returned >= limit:
+            return (
+                "=== MAY BE TRUNCATED ===\n"
+                f"Result returned exactly the requested limit "
+                f"({limit}) and the true total could not be determined. "
+                "Treat this as a possibly-incomplete sample. For "
+                "counting questions, do NOT report "
+                f"{n_returned} as the answer — use ckan__aggregate_data "
+                'with metrics={"count": "count(*)"} and the same '
+                "filter, or re-run with a higher limit.\n"
+                "========================"
+            )
+
+        return ""
 
     def _format_schema_footer(
         self, fields: Optional[List[Dict[str, Any]]]
@@ -1587,23 +1738,50 @@ class CKANPlugin(DataPlugin):
         resource = composite.get("resource", {}) or {}
         records = composite.get("records", []) or []
         fields = composite.get("fields", []) or []
+        total = composite.get("total")
         alternates = composite.get("alternate_datasets", []) or []
 
         dataset_id = dataset.get("id", "unknown")
         dataset_title = dataset.get("title", "Untitled")
         resource_id = resource.get("id", "unknown")
         resource_name = resource.get("name", "Unnamed")
+        n_returned = len(records)
 
-        lines: List[str] = [
-            "=== search_and_query result ===",
-            f"matched_dataset: {dataset_title}",
-            f"dataset_id: {dataset_id}",
-            f"resource_id (use with ckan__query_data): {resource_id}",
-            f"resource_name: {resource_name}",
-            f"row_count: {len(records)} (limit={limit})",
-            "================================",
-            "",
-        ]
+        # Total line: prefer "true total" so the model can't read the
+        # returned-rows count as the answer to a counting question.
+        if total is not None and total != n_returned:
+            count_line = (
+                f"total_matching_rows: {total} "
+                f"(returned {n_returned}, limit={limit})"
+            )
+        elif total is not None:
+            count_line = f"total_matching_rows: {total} (limit={limit})"
+        else:
+            count_line = (
+                f"returned_rows: {n_returned} "
+                f"(limit={limit}, total unknown)"
+            )
+
+        lines: List[str] = []
+        truncated_warning = self._format_truncation_block(
+            n_returned, limit, total
+        )
+        if truncated_warning:
+            lines.append(truncated_warning)
+            lines.append("")
+
+        lines.extend(
+            [
+                "=== search_and_query result ===",
+                f"matched_dataset: {dataset_title}",
+                f"dataset_id: {dataset_id}",
+                f"resource_id (use with ckan__query_data): {resource_id}",
+                f"resource_name: {resource_name}",
+                count_line,
+                "================================",
+                "",
+            ]
+        )
 
         if not records:
             lines.append(
@@ -1611,15 +1789,20 @@ class CKANPlugin(DataPlugin):
                 "dataset/resource (see alternates below)."
             )
         else:
-            lines.append(f"Showing up to 5 of {len(records)} record(s):")
+            preview_caption = (
+                f"Showing first 5 of {n_returned} returned"
+                + (f" (true total: {total})" if total is not None else "")
+                + ":"
+            )
+            lines.append(preview_caption)
             for i, record in enumerate(records[:5], 1):
                 lines.append(f"Record {i}:")
                 for key, value in record.items():
                     if key != "_id":
                         lines.append(f"  {key}: {value}")
                 lines.append("")
-            if len(records) > 5:
-                lines.append(f"... and {len(records) - 5} more record(s)")
+            if n_returned > 5:
+                lines.append(f"... and {n_returned - 5} more record(s) returned")
 
         schema_footer = self._format_schema_footer(fields)
         if schema_footer:

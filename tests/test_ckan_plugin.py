@@ -1171,6 +1171,254 @@ class TestExecuteTool:
             assert "z (int)" in text
 
     @pytest.mark.asyncio
+    async def test_query_data_surfaces_total_from_datastore_search(
+        self, ckan_config
+    ):
+        """When CKAN returns `total`, format prefers total_matching_rows
+        over returned_rows."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(100)],
+                    "fields": [{"id": "_id", "type": "int"}],
+                    "total": 531,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_query]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "limit": 100,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "total_matching_rows: 531" in text
+            assert "TRUNCATED" in text
+            assert "the answer is 531, NOT 100" in text
+            assert "ckan__aggregate_data" in text
+
+    @pytest.mark.asyncio
+    async def test_query_data_no_truncation_warning_when_under_limit(
+        self, ckan_config
+    ):
+        """When records returned < limit, no truncation warning shown."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(85)],
+                    "fields": [{"id": "_id", "type": "int"}],
+                    "total": 85,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_query]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "limit": 100,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "total_matching_rows: 85" in text
+            assert "TRUNCATED" not in text
+
+    @pytest.mark.asyncio
+    async def test_query_data_where_path_does_count_followup_when_truncated(
+        self, ckan_config
+    ):
+        """SQL (`where`) path: when SELECT * hits the limit, the plugin
+        must do a COUNT(*) follow-up so the model gets a real total
+        rather than mistaking the limit for the count."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            # First SQL call: SELECT * returns exactly limit rows
+            mock_response_select = Mock()
+            mock_response_select.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": i, "case_id": f"c{i}"} for i in range(100)
+                    ],
+                    "fields": [
+                        {"id": "case_id", "type": "text"},
+                        {"id": "closed_dt", "type": "timestamp"},
+                    ],
+                }
+            }
+            mock_response_select.raise_for_status = Mock()
+            # Follow-up SQL call: SELECT COUNT(*) returns the true total
+            mock_response_count = Mock()
+            mock_response_count.json.return_value = {
+                "result": {"records": [{"n": 531}]}
+            }
+            mock_response_count.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_select,
+                    mock_response_count,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {
+                        "closed_dt": {
+                            "gte": "2016-04-29",
+                            "lt": "2016-04-30",
+                        }
+                    },
+                    "limit": 100,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "total_matching_rows: 531" in text
+            assert "TRUNCATED" in text
+            assert "the answer is 531, NOT 100" in text
+            # Follow-up COUNT(*) actually issued
+            assert mock_client.post.call_count == 3
+            count_call = mock_client.post.call_args_list[2]
+            count_sql = count_call[1]["json"]["sql"]
+            assert "COUNT(*)" in count_sql
+            assert '"closed_dt" >= \'2016-04-29\'' in count_sql
+
+    @pytest.mark.asyncio
+    async def test_query_data_where_path_no_count_when_under_limit(
+        self, ckan_config
+    ):
+        """SQL path: if records returned < limit we already know the total
+        — no extra COUNT(*) call should fire."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_select = Mock()
+            mock_response_select.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(85)],
+                    "fields": [],
+                }
+            }
+            mock_response_select.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_select]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {"x": {"gt": 1}},
+                    "limit": 100,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "total_matching_rows: 85" in text
+            assert "TRUNCATED" not in text
+            # init + SELECT only, no COUNT(*)
+            assert mock_client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_query_data_where_path_count_failure_falls_back_to_warning(
+        self, ckan_config
+    ):
+        """If the COUNT(*) follow-up fails, we still return the data with
+        a 'MAY BE TRUNCATED' warning rather than failing the whole call."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_select = Mock()
+            mock_response_select.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(100)],
+                    "fields": [],
+                }
+            }
+            mock_response_select.raise_for_status = Mock()
+            # COUNT(*) call fails server-side
+            mock_response_count_fail = Mock()
+            mock_response_count_fail.json.return_value = {
+                "success": False,
+                "error": {"message": "COUNT failed"},
+            }
+            mock_response_count_fail.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_select,
+                    mock_response_count_fail,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {"x": {"gt": 1}},
+                    "limit": 100,
+                },
+            )
+
+            # Whole call still succeeds — count-failure must not block data
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "MAY BE TRUNCATED" in text
+
+    @pytest.mark.asyncio
     async def test_query_data_404_includes_datastore_active_hint(self, ckan_config):
         """A 404 from query_data should append the datastore_active hint."""
         plugin = CKANPlugin(ckan_config)
