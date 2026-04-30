@@ -1873,8 +1873,8 @@ class CKANPlugin(DataPlugin):
         if siblings:
             lines.append("")
             lines.append(
-                f"Other queryable resources in this dataset "
-                f"(pass resource_name=... to pick one):"
+                "Other queryable resources in this dataset "
+                "(pass resource_name=... to pick one):"
             )
             for r in siblings:
                 r_name = r.get("name") or "(unnamed)"
