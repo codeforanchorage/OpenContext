@@ -136,7 +136,7 @@ class TestGetTools:
         plugin = CKANPlugin(ckan_config)
         tools = plugin.get_tools()
 
-        assert len(tools) == 6
+        assert len(tools) == 7
         tool_names = [t.name for t in tools]
         assert "search_datasets" in tool_names
         assert "get_dataset" in tool_names
@@ -144,6 +144,7 @@ class TestGetTools:
         assert "get_schema" in tool_names
         assert "execute_sql" in tool_names
         assert "aggregate_data" in tool_names
+        assert "search_and_query" in tool_names
 
     def test_get_tools_includes_city_name_in_descriptions(self, ckan_config):
         """Test that tool descriptions include city name."""
@@ -542,6 +543,131 @@ class TestExecuteTool:
 
             assert result.success is False
             assert "required" in result.error_message.lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_succeeds(self, ckan_config):
+        """search_and_query returns rows from the first resource of the first match."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            # 1) search_datasets
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "dataset-1",
+                            "title": "311 Service Requests",
+                            "resources": [
+                                {
+                                    "id": "11111111-2222-3333-4444-555555555555",
+                                    "name": "311 CSV",
+                                    "format": "CSV",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            # 2) datastore_search (query_data)
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "type": "Pothole"},
+                        {"_id": 2, "type": "Streetlight"},
+                    ]
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "311", "limit": 10}
+            )
+
+            assert result.success is True
+            assert len(result.content) == 1
+            text = result.content[0]["text"]
+            # Header surfaces the chosen IDs
+            assert "11111111-2222-3333-4444-555555555555" in text
+            assert "dataset-1" in text
+            # Rows from the second mocked call show up
+            assert "Pothole" in text or "Streetlight" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_no_matches(self, ckan_config):
+        """search_and_query returns an error when no datasets match."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {"result": {"results": []}}
+            mock_response_search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_search]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "nonexistent-keyword-xyz"}
+            )
+
+            assert result.success is False
+            assert result.error_message is not None
+            assert "No datasets found" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_dataset_has_no_resources(
+        self, ckan_config
+    ):
+        """search_and_query reports an error when the matched dataset has no resources."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {"id": "dataset-empty", "title": "Empty", "resources": []}
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_search]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "anything"}
+            )
+
+            assert result.success is False
+            assert "no resources" in (result.error_message or "").lower()
 
     @pytest.mark.asyncio
     async def test_execute_tool_unknown_tool(self, ckan_config):

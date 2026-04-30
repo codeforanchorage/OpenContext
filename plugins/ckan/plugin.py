@@ -155,20 +155,39 @@ class CKANPlugin(DataPlugin):
         Returns:
             List of tool definitions
         """
+        city = self.plugin_config.city_name
         return [
             ToolDefinition(
                 name="search_datasets",
-                description=f"Search for datasets in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Search for datasets in {city}'s open data portal by keyword.\n\n"
+                    "Returns a list of CKAN datasets. Each dataset contains a "
+                    "`resources` array; each resource has its own `id` (a UUID) "
+                    "that identifies a queryable table.\n\n"
+                    "Next step:\n"
+                    "  - EASIEST: if you just want data rows, call "
+                    "`ckan__search_and_query` with the same query — it combines "
+                    "search + query in one call.\n"
+                    "  - Otherwise: pick a resource from `resources[].id` in the "
+                    "response and call `ckan__query_data` with that value as "
+                    "`resource_id`.\n"
+                    "  - To inspect a dataset's resources first, call "
+                    "`ckan__get_dataset` with `dataset_id` set to the dataset's "
+                    "`id` or `name`.\n\n"
+                    "The formatted response surfaces a `suggested_resource_id` "
+                    "and `suggested_next_tool` line at the top — read those to "
+                    "pick the next call."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query string",
+                            "description": "Free-text search keywords (e.g. '311 service requests', 'building permits').",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of results (default: 20)",
+                            "description": "Maximum number of datasets to return (default: 20).",
                             "default": 20,
                         },
                     },
@@ -177,13 +196,27 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="get_dataset",
-                description=f"Get detailed information about a specific dataset from {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Get full metadata for one dataset in {city}'s open data "
+                    "portal, including its `resources` array.\n\n"
+                    "Use this to find the resource UUIDs needed by "
+                    "`ckan__query_data`, `ckan__get_schema`, "
+                    "`ckan__aggregate_data`, or `ckan__execute_sql`. The "
+                    "response lists each resource with its `Resource ID` "
+                    "(a UUID).\n\n"
+                    "Next step: call `ckan__query_data` with `resource_id` set "
+                    "to one of the `Resource ID` values from this response."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "dataset_id": {
                             "type": "string",
-                            "description": "Dataset ID or name",
+                            "description": (
+                                "Dataset ID or slug. Provenance: the `id` "
+                                "(or `name`) field of a dataset returned by "
+                                "`ckan__search_datasets`. NOT a resource UUID."
+                            ),
                         },
                     },
                     "required": ["dataset_id"],
@@ -191,21 +224,38 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="query_data",
-                description=f"Query data from a specific resource in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Query rows from a specific resource in {city}'s open "
+                    "data portal.\n\n"
+                    "The `resource_id` parameter is a CKAN resource UUID — "
+                    "NOT a dataset ID. Get one by first calling "
+                    "`ckan__search_datasets` or `ckan__get_dataset` and "
+                    "reading the `id` inside the `resources` array.\n\n"
+                    "Tip: if you only have a keyword and no resource_id yet, "
+                    "use `ckan__search_and_query` instead — it does the "
+                    "lookup and the data fetch in a single call."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "resource_id": {
                             "type": "string",
-                            "description": "Resource ID to query",
+                            "description": (
+                                "CKAN resource UUID (36-char, e.g. "
+                                "'11111111-2222-3333-4444-555555555555'). "
+                                "Provenance: the `id` field inside the "
+                                "`resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`. This is NOT a dataset ID."
+                            ),
                         },
                         "filters": {
                             "type": "object",
-                            "description": "Optional filters (field: value pairs)",
+                            "description": "Optional filters as field:value pairs (e.g. {\"status\": \"Open\"}).",
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum number of records (default: 100)",
+                            "description": "Maximum number of records (default: 100).",
                             "default": 100,
                         },
                     },
@@ -214,13 +264,28 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="get_schema",
-                description=f"Get schema information for a resource in {self.plugin_config.city_name}'s open data portal",
+                description=(
+                    f"Get the schema (field names and types) for a resource "
+                    f"in {city}'s open data portal.\n\n"
+                    "Call this BEFORE `ckan__aggregate_data` or "
+                    "`ckan__execute_sql` so you know the exact field names "
+                    "to reference in `group_by`, `metrics`, SELECT, or WHERE "
+                    "clauses.\n\n"
+                    "Next step: pass the field names you discover to "
+                    "`ckan__aggregate_data` (in `group_by` / `metrics`) or "
+                    "to `ckan__execute_sql`."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "resource_id": {
                             "type": "string",
-                            "description": "Resource ID",
+                            "description": (
+                                "CKAN resource UUID. Provenance: the `id` "
+                                "inside the `resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`."
+                            ),
                         },
                     },
                     "required": ["resource_id"],
@@ -228,25 +293,29 @@ class CKANPlugin(DataPlugin):
             ),
             ToolDefinition(
                 name="execute_sql",
-                description="""Execute raw PostgreSQL SELECT query.
-
-⚠️ Advanced users only. For complex queries requiring full SQL.
-
-Security: Only SELECT allowed. INSERT/UPDATE/DELETE blocked.
-
-Examples:
-- Window functions: RANK() OVER (...)
-- CTEs: WITH subquery AS (...)
-- Complex aggregations: PERCENTILE_CONT(0.5) WITHIN GROUP
-
-Resource IDs must be double-quoted: FROM "uuid-here"
-""",
+                description=(
+                    f"Execute a raw PostgreSQL SELECT query against "
+                    f"{city}'s CKAN datastore.\n\n"
+                    "⚠️ Advanced users only. For complex queries requiring "
+                    "full SQL.\n\n"
+                    "Security: Only SELECT allowed. INSERT/UPDATE/DELETE "
+                    "blocked.\n\n"
+                    "Examples:\n"
+                    "- Window functions: RANK() OVER (...)\n"
+                    "- CTEs: WITH subquery AS (...)\n"
+                    "- Complex aggregations: PERCENTILE_CONT(0.5) WITHIN GROUP\n\n"
+                    "Resource IDs must be double-quoted: FROM \"uuid-here\"\n\n"
+                    "Prerequisites:\n"
+                    "  - resource UUID for the FROM clause: get from "
+                    "`ckan__search_datasets` or `ckan__get_dataset`.\n"
+                    "  - field names: get from `ckan__get_schema`."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "sql": {
                             "type": "string",
-                            "description": "PostgreSQL SELECT statement",
+                            "description": "PostgreSQL SELECT statement. Resource UUIDs in FROM must be double-quoted.",
                         },
                     },
                     "required": ["sql"],
@@ -254,32 +323,98 @@ Resource IDs must be double-quoted: FROM "uuid-here"
             ),
             ToolDefinition(
                 name="aggregate_data",
-                description=f"""Aggregate data with GROUP BY from {self.plugin_config.city_name}'s open data portal.
-
-Prerequisites: get_schema for field names
-
-Examples:
-- Count by field: group_by=["neighborhood"], metrics={{count: "count(*)"}}
-- Multiple metrics: metrics={{total: "count(*)", avg: "avg(field)"}}
-- With filters: filters={{"status": "Open"}}
-
-Supports: count(*), sum(), avg(), min(), max(), stddev()
-""",
+                description=(
+                    f"Aggregate data with GROUP BY from {city}'s open data "
+                    "portal.\n\n"
+                    "Prerequisites:\n"
+                    "  - `resource_id`: get from `ckan__search_datasets` / "
+                    "`ckan__get_dataset` (the `id` inside the `resources` "
+                    "array).\n"
+                    "  - field names for `group_by` / `metrics`: get from "
+                    "`ckan__get_schema`.\n\n"
+                    "Examples:\n"
+                    '- Count by field: group_by=["neighborhood"], '
+                    'metrics={"count": "count(*)"}\n'
+                    '- Multiple metrics: metrics={"total": "count(*)", '
+                    '"avg": "avg(field)"}\n'
+                    '- With filters: filters={"status": "Open"}\n\n'
+                    "Supports: count(*), sum(), avg(), min(), max(), stddev()."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "resource_id": {"type": "string"},
+                        "resource_id": {
+                            "type": "string",
+                            "description": (
+                                "CKAN resource UUID. Provenance: the `id` "
+                                "inside the `resources` array returned by "
+                                "`ckan__search_datasets` or "
+                                "`ckan__get_dataset`."
+                            ),
+                        },
                         "group_by": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "description": "Field names to group by. Get exact names from `ckan__get_schema`.",
                         },
-                        "metrics": {"type": "object"},
+                        "metrics": {
+                            "type": "object",
+                            "description": "Map of alias -> aggregate expression, e.g. {\"count\": \"count(*)\"}.",
+                        },
                         "filters": {"type": "object"},
                         "having": {"type": "object"},
                         "order_by": {"type": "string"},
                         "limit": {"type": "integer", "default": 100},
                     },
                     "required": ["resource_id", "metrics"],
+                },
+            ),
+            ToolDefinition(
+                name="search_and_query",
+                description=(
+                    f"ONE-CALL keyword-to-data for {city}'s open data "
+                    "portal: searches for the best-matching dataset and "
+                    "immediately returns rows from its first resource — no "
+                    "tool chaining required.\n\n"
+                    "Use this when you have a keyword (e.g. "
+                    "'311 service requests', 'building permits') and want "
+                    "actual data rows. It combines "
+                    "`ckan__search_datasets` + `ckan__query_data` into a "
+                    "single server-side step, so you do NOT need to extract "
+                    "a resource_id from a previous response.\n\n"
+                    "Returns: data rows from the chosen dataset's chosen "
+                    "resource, plus a header showing which dataset and "
+                    "resource were used so you can drill deeper with "
+                    "`ckan__query_data` or `ckan__get_dataset` if needed."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Free-text search keywords (e.g. '311 service requests').",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of data rows to return (default: 100).",
+                            "default": 100,
+                        },
+                        "filters": {
+                            "type": "object",
+                            "description": "Optional row-level filters as field:value pairs, applied to the matched resource.",
+                        },
+                        "dataset_index": {
+                            "type": "integer",
+                            "description": "Which search result to use (0 = best match, default 0).",
+                            "default": 0,
+                        },
+                        "resource_index": {
+                            "type": "integer",
+                            "description": "Which resource within the chosen dataset to query (0 = first, default 0).",
+                            "default": 0,
+                        },
+                    },
+                    "required": ["query"],
                 },
             ),
         ]
@@ -391,6 +526,43 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 formatted_text = self._format_sql_results(records, fields)
                 return ToolResult(
                     content=[{"type": "text", "text": formatted_text}],
+                    success=True,
+                )
+
+            elif tool_name == "search_and_query":
+                query = arguments.get("query")
+                if not query:
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message="query is required",
+                    )
+                limit = arguments.get("limit", 100)
+                filters = arguments.get("filters") or {}
+                dataset_index = arguments.get("dataset_index", 0)
+                resource_index = arguments.get("resource_index", 0)
+                composite = await self.search_and_query(
+                    query=query,
+                    limit=limit,
+                    filters=filters,
+                    dataset_index=dataset_index,
+                    resource_index=resource_index,
+                )
+                if composite.get("error"):
+                    return ToolResult(
+                        content=[],
+                        success=False,
+                        error_message=composite.get(
+                            "message", "search_and_query failed"
+                        ),
+                    )
+                return ToolResult(
+                    content=[
+                        {
+                            "type": "text",
+                            "text": self._format_search_and_query(composite, limit),
+                        }
+                    ],
                     success=True,
                 )
 
@@ -628,6 +800,100 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
 
         return await self.execute_sql(sql)
 
+    async def search_and_query(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        dataset_index: int = 0,
+        resource_index: int = 0,
+    ) -> Dict[str, Any]:
+        """Search for a dataset and immediately query its first resource.
+
+        Combines search_datasets + query_data into one server-side step so
+        callers don't have to extract a resource_id from a previous response.
+
+        Returns:
+            Dict with either {"error": True, "message": ...} or
+            {"dataset": {...}, "resource": {...}, "records": [...]}.
+        """
+        # Cap how many search results we fetch so dataset_index can pick a
+        # non-best match without an unbounded scan.
+        search_rows = max(dataset_index + 1, 5)
+        datasets = await self.search_datasets(query, limit=search_rows)
+        if not datasets:
+            return {
+                "error": True,
+                "message": (
+                    f"No datasets found for query {query!r} in "
+                    f"{self.plugin_config.city_name}'s open data portal."
+                ),
+            }
+
+        if dataset_index < 0 or dataset_index >= len(datasets):
+            return {
+                "error": True,
+                "message": (
+                    f"dataset_index {dataset_index} is out of range "
+                    f"(found {len(datasets)} dataset(s))."
+                ),
+            }
+
+        chosen_dataset = datasets[dataset_index]
+        resources = chosen_dataset.get("resources") or []
+        if not resources:
+            return {
+                "error": True,
+                "message": (
+                    f"Dataset {chosen_dataset.get('id')!r} has no resources. "
+                    f"Try a different dataset_index or call ckan__get_dataset "
+                    f"to inspect available resources."
+                ),
+            }
+
+        if resource_index < 0 or resource_index >= len(resources):
+            return {
+                "error": True,
+                "message": (
+                    f"resource_index {resource_index} is out of range for "
+                    f"dataset {chosen_dataset.get('id')!r} "
+                    f"(has {len(resources)} resource(s))."
+                ),
+            }
+
+        chosen_resource = resources[resource_index]
+        resource_id = chosen_resource.get("id")
+        if not resource_id:
+            return {
+                "error": True,
+                "message": (
+                    f"Resource at index {resource_index} of dataset "
+                    f"{chosen_dataset.get('id')!r} has no id."
+                ),
+            }
+
+        try:
+            records = await self.query_data(
+                resource_id=resource_id,
+                filters=filters or None,
+                limit=limit,
+            )
+        except Exception as e:
+            return {
+                "error": True,
+                "message": (
+                    f"Found dataset {chosen_dataset.get('id')!r} resource "
+                    f"{resource_id!r} but query_data failed: {e}"
+                ),
+            }
+
+        return {
+            "dataset": chosen_dataset,
+            "resource": chosen_resource,
+            "records": records,
+            "alternate_datasets": datasets,
+        }
+
     async def health_check(self) -> bool:
         """Check if CKAN API is accessible.
 
@@ -646,9 +912,43 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         if not datasets:
             return f"No datasets found in {self.plugin_config.city_name}'s open data portal."
 
-        lines = [
+        suggested_resource_id: Optional[str] = None
+        suggested_dataset_id: Optional[str] = None
+        for ds in datasets:
+            resources = ds.get("resources") or []
+            if resources:
+                suggested_resource_id = resources[0].get("id")
+                suggested_dataset_id = ds.get("id")
+                if suggested_resource_id:
+                    break
+
+        lines: List[str] = []
+        if suggested_resource_id:
+            lines.extend(
+                [
+                    "=== NEXT STEP (read this first) ===",
+                    f"suggested_resource_id: {suggested_resource_id}",
+                    "suggested_next_tool: ckan__query_data",
+                    f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
+                    "(or use ckan__search_and_query for a one-call keyword-to-data flow)",
+                    "===================================",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "=== NEXT STEP ===",
+                    "No resource UUIDs were attached to these datasets. Call "
+                    "ckan__get_dataset with a dataset_id below to look them up.",
+                    "=================",
+                    "",
+                ]
+            )
+
+        lines.append(
             f"Found {len(datasets)} dataset(s) in {self.plugin_config.city_name}'s open data portal:\n"
-        ]
+        )
 
         for i, dataset in enumerate(datasets, 1):
             title = dataset.get("title", "Untitled")
@@ -658,9 +958,15 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 if dataset.get("notes")
                 else "No description"
             )
+            resources = dataset.get("resources") or []
+            first_resource_id = resources[0].get("id") if resources else None
 
             lines.append(f"{i}. {title}")
-            lines.append(f"   ID: {dataset_id}")
+            lines.append(f"   dataset_id: {dataset_id}")
+            if first_resource_id:
+                lines.append(
+                    f"   resource_id (use this with ckan__query_data): {first_resource_id}"
+                )
             lines.append(f"   Description: {notes}")
             lines.append(
                 f"   Portal: {self.plugin_config.portal_url}/dataset/{dataset_id}"
@@ -669,8 +975,12 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
 
         lines.append(
             f"View all datasets at: {self.plugin_config.portal_url}\n"
-            f"Use get_dataset tool with a dataset ID to get more details."
+            f"Use ckan__get_dataset with a dataset_id (above) for full resource details, "
+            f"or ckan__query_data with a resource_id to fetch rows."
         )
+        if suggested_dataset_id:
+            # Hint for narrative chaining: makes the dataset_id discoverable too.
+            lines.append(f"suggested_dataset_id: {suggested_dataset_id}")
 
         return "\n".join(lines)
 
@@ -680,17 +990,36 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
         dataset_id = dataset.get("id", "unknown")
         notes = dataset.get("notes", "No description")
         organization = dataset.get("organization", {}).get("title", "Unknown")
-        resources = dataset.get("resources", [])
+        resources = dataset.get("resources", []) or []
 
-        lines = [
-            f"Dataset: {title}",
-            f"ID: {dataset_id}",
-            f"Organization: {organization}",
-            f"Description: {notes}",
-            "",
-            f"Portal URL: {self.plugin_config.portal_url}/dataset/{dataset_id}",
-            "",
-        ]
+        suggested_resource_id = (
+            resources[0].get("id") if resources else None
+        )
+
+        lines: List[str] = []
+        if suggested_resource_id:
+            lines.extend(
+                [
+                    "=== NEXT STEP (read this first) ===",
+                    f"suggested_resource_id: {suggested_resource_id}",
+                    "suggested_next_tool: ckan__query_data",
+                    f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
+                    "===================================",
+                    "",
+                ]
+            )
+
+        lines.extend(
+            [
+                f"Dataset: {title}",
+                f"dataset_id: {dataset_id}",
+                f"Organization: {organization}",
+                f"Description: {notes}",
+                "",
+                f"Portal URL: {self.plugin_config.portal_url}/dataset/{dataset_id}",
+                "",
+            ]
+        )
 
         if resources:
             lines.append(f"Resources ({len(resources)}):")
@@ -699,12 +1028,15 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
                 res_id = resource.get("id", "unknown")
                 res_format = resource.get("format", "unknown")
                 lines.append(f"  {i}. {res_name} ({res_format})")
-                lines.append(f"     Resource ID: {res_id}")
+                lines.append(f"     resource_id: {res_id}")
                 lines.append(
-                    f"     Use query_data tool with resource_id='{res_id}' to query this data"
+                    f"     Use ckan__query_data with resource_id=\"{res_id}\" to fetch rows."
                 )
         else:
-            lines.append("No resources available for this dataset.")
+            lines.append(
+                "No resources available for this dataset. Try a different "
+                "dataset_id or use ckan__search_datasets again."
+            )
 
         return "\n".join(lines)
 
@@ -743,6 +1075,68 @@ Supports: count(*), sum(), avg(), min(), max(), stddev()
             lines.append(f"  • {field_id} ({field_type})")
             if description:
                 lines.append(f"    {description}")
+
+        return "\n".join(lines)
+
+    def _format_search_and_query(
+        self, composite: Dict[str, Any], limit: int
+    ) -> str:
+        """Format a search_and_query composite result for user display."""
+        dataset = composite.get("dataset", {}) or {}
+        resource = composite.get("resource", {}) or {}
+        records = composite.get("records", []) or []
+        alternates = composite.get("alternate_datasets", []) or []
+
+        dataset_id = dataset.get("id", "unknown")
+        dataset_title = dataset.get("title", "Untitled")
+        resource_id = resource.get("id", "unknown")
+        resource_name = resource.get("name", "Unnamed")
+
+        lines: List[str] = [
+            "=== search_and_query result ===",
+            f"matched_dataset: {dataset_title}",
+            f"dataset_id: {dataset_id}",
+            f"resource_id (use with ckan__query_data): {resource_id}",
+            f"resource_name: {resource_name}",
+            f"row_count: {len(records)} (limit={limit})",
+            "================================",
+            "",
+        ]
+
+        if not records:
+            lines.append(
+                "No rows returned. Try broadening filters or pick a different "
+                "dataset/resource (see alternates below)."
+            )
+        else:
+            lines.append(f"Showing up to 5 of {len(records)} record(s):")
+            for i, record in enumerate(records[:5], 1):
+                lines.append(f"Record {i}:")
+                for key, value in record.items():
+                    if key != "_id":
+                        lines.append(f"  {key}: {value}")
+                lines.append("")
+            if len(records) > 5:
+                lines.append(f"... and {len(records) - 5} more record(s)")
+
+        if len(alternates) > 1:
+            lines.append("")
+            lines.append(
+                "Other matching datasets (pass dataset_index=N to switch):"
+            )
+            for i, alt in enumerate(alternates):
+                if i == 0:
+                    continue  # the chosen one
+                alt_title = alt.get("title", "Untitled")
+                alt_id = alt.get("id", "unknown")
+                alt_resources = alt.get("resources") or []
+                alt_resource_id = (
+                    alt_resources[0].get("id") if alt_resources else None
+                )
+                lines.append(f"  [dataset_index={i}] {alt_title}")
+                lines.append(f"    dataset_id: {alt_id}")
+                if alt_resource_id:
+                    lines.append(f"    resource_id: {alt_resource_id}")
 
         return "\n".join(lines)
 
