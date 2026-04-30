@@ -567,6 +567,7 @@ class TestExecuteTool:
                                     "id": "11111111-2222-3333-4444-555555555555",
                                     "name": "311 CSV",
                                     "format": "CSV",
+                                    "datastore_active": True,
                                 }
                             ],
                         }
@@ -667,7 +668,191 @@ class TestExecuteTool:
             )
 
             assert result.success is False
-            assert "no resources" in (result.error_message or "").lower()
+            err = (result.error_message or "").lower()
+            assert "no queryable" in err or "no resources" in err
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_skips_download_only_resources(
+        self, ckan_config
+    ):
+        """Parks-style regression: a dataset with GeoJSON/KML/SHP first and a
+        single datastore_active CSV — the composite tool must skip past the
+        download-only resources and query the CSV one."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "dataset-parks",
+                            "title": "Park_Features",
+                            "resources": [
+                                {
+                                    "id": "0826fc19-4ff8-44a5-b9c4-916960d8cfb3",
+                                    "format": "GeoJSON",
+                                    "datastore_active": False,
+                                },
+                                {
+                                    "id": "4d28fc98-c503-4065-987f-9fbc41947fc4",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "5f130274-b67e-44e6-9c72-4175a2dca339",
+                                    "format": "SHP",
+                                    "datastore_active": False,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "park_name": "Boston Common"},
+                        {"_id": 2, "park_name": "Franklin Park"},
+                    ]
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "parks"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Picked the CSV resource, not the GeoJSON one
+            assert "4d28fc98-c503-4065-987f-9fbc41947fc4" in text
+            assert "0826fc19-4ff8-44a5-b9c4-916960d8cfb3" not in text
+            assert "Boston Common" in text or "Franklin Park" in text
+            # And the third call's body asked for the CSV resource
+            third_call = mock_client.post.call_args_list[2]
+            assert third_call[1]["json"]["resource_id"] == (
+                "4d28fc98-c503-4065-987f-9fbc41947fc4"
+            )
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_walks_to_next_dataset(
+        self, ckan_config
+    ):
+        """If the best-match dataset has no datastore_active resource, the
+        composite tool falls through to the next dataset."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "dataset-no-datastore",
+                            "title": "PDFs only",
+                            "resources": [
+                                {
+                                    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                                    "format": "PDF",
+                                    "datastore_active": False,
+                                }
+                            ],
+                        },
+                        {
+                            "id": "dataset-with-csv",
+                            "title": "Has CSV",
+                            "resources": [
+                                {
+                                    "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                }
+                            ],
+                        },
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {"records": [{"_id": 1, "x": 1}]}
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "anything"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" in text
+            assert "Has CSV" in text
+
+    @pytest.mark.asyncio
+    async def test_query_data_404_includes_datastore_active_hint(self, ckan_config):
+        """A 404 from query_data should append the datastore_active hint."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_404 = Mock()
+            mock_response_404.status_code = 404
+            mock_response_404.json.return_value = {
+                "success": False,
+                "error": {"message": "Resource not found"},
+            }
+            mock_response_404.raise_for_status = Mock(
+                side_effect=httpx.HTTPStatusError(
+                    "Not Found",
+                    request=Mock(),
+                    response=mock_response_404,
+                )
+            )
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_404]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "0826fc19-4ff8-44a5-b9c4-916960d8cfb3"},
+            )
+
+            assert result.success is False
+            assert "datastore_active" in (result.error_message or "")
 
     @pytest.mark.asyncio
     async def test_execute_tool_unknown_tool(self, ckan_config):

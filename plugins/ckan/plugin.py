@@ -84,6 +84,25 @@ class CKANPlugin(DataPlugin):
         self._initialized = False
         logger.info("CKAN plugin shut down")
 
+    @staticmethod
+    def _is_queryable(resource: Dict[str, Any]) -> bool:
+        """A CKAN resource is queryable via datastore_search only if it has
+        been loaded into CKAN's Postgres datastore. Boston attaches each
+        dataset as 5–7 download-only resources (GeoJSON, KML, SHP, ...) plus
+        a single CSV that's actually loaded; only that one returns rows."""
+        return bool(resource.get("datastore_active"))
+
+    @classmethod
+    def _first_queryable_resource(
+        cls, dataset: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return the first resource of a dataset that is loaded into the
+        datastore (i.e. answers datastore_search), or None if none are."""
+        for res in dataset.get("resources") or []:
+            if cls._is_queryable(res):
+                return res
+        return None
+
     def _parse_ckan_error(
         self, response_body: Dict[str, Any], context: str = ""
     ) -> str:
@@ -231,9 +250,19 @@ class CKANPlugin(DataPlugin):
                     "NOT a dataset ID. Get one by first calling "
                     "`ckan__search_datasets` or `ckan__get_dataset` and "
                     "reading the `id` inside the `resources` array.\n\n"
-                    "Tip: if you only have a keyword and no resource_id yet, "
-                    "use `ckan__search_and_query` instead — it does the "
-                    "lookup and the data fetch in a single call."
+                    "IMPORTANT: only resources with `datastore_active=true` "
+                    "are queryable here. Boston datasets typically attach "
+                    "5–7 resources (GeoJSON, KML, SHP, PDF, ArcGIS REST, "
+                    "CSV) but only the CSV one is loaded into the "
+                    "datastore. If you call this tool with a download-only "
+                    "resource UUID it will return 404. The output of "
+                    "`ckan__search_datasets` and `ckan__get_dataset` "
+                    "labels resources as QUERYABLE or DOWNLOAD-ONLY — pick "
+                    "the QUERYABLE one.\n\n"
+                    "Tip: if you only have a keyword and no resource_id "
+                    "yet, use `ckan__search_and_query` instead — it does "
+                    "the lookup and the data fetch in a single call and "
+                    "auto-picks the datastore-loaded resource."
                 ),
                 input_schema={
                     "type": "object",
@@ -374,14 +403,21 @@ class CKANPlugin(DataPlugin):
                 description=(
                     f"ONE-CALL keyword-to-data for {city}'s open data "
                     "portal: searches for the best-matching dataset and "
-                    "immediately returns rows from its first resource — no "
-                    "tool chaining required.\n\n"
+                    "immediately returns rows from its first datastore-"
+                    "loaded resource — no tool chaining required.\n\n"
                     "Use this when you have a keyword (e.g. "
-                    "'311 service requests', 'building permits') and want "
-                    "actual data rows. It combines "
+                    "'311 service requests', 'parks', 'building permits') "
+                    "and want actual data rows. It combines "
                     "`ckan__search_datasets` + `ckan__query_data` into a "
-                    "single server-side step, so you do NOT need to extract "
-                    "a resource_id from a previous response.\n\n"
+                    "single server-side step, so you do NOT need to "
+                    "extract a resource_id from a previous response.\n\n"
+                    "Auto-picks the right resource: Boston datasets "
+                    "typically attach 5–7 resources (GeoJSON, KML, SHP, "
+                    "PDF, ArcGIS REST, CSV) but only the CSV is loaded "
+                    "into the queryable datastore. This tool walks the "
+                    "search results and skips datasets / resources that "
+                    "aren't datastore-active, so you don't get a 404 "
+                    "from a download-only resource.\n\n"
                     "Returns: data rows from the chosen dataset's chosen "
                     "resource, plus a header showing which dataset and "
                     "resource were used so you can drill deeper with "
@@ -405,13 +441,22 @@ class CKANPlugin(DataPlugin):
                         },
                         "dataset_index": {
                             "type": "integer",
-                            "description": "Which search result to use (0 = best match, default 0).",
-                            "default": 0,
+                            "description": (
+                                "Which search result to use (0 = best "
+                                "match). If omitted, walks the search "
+                                "results until one with a queryable "
+                                "(datastore_active) resource is found."
+                            ),
                         },
                         "resource_index": {
                             "type": "integer",
-                            "description": "Which resource within the chosen dataset to query (0 = first, default 0).",
-                            "default": 0,
+                            "description": (
+                                "Which resource within the chosen dataset "
+                                "to query. If omitted, auto-picks the "
+                                "first datastore_active resource (Boston "
+                                "datasets typically attach 5–7 resources "
+                                "but only the CSV is queryable)."
+                            ),
                         },
                     },
                     "required": ["query"],
@@ -539,8 +584,8 @@ class CKANPlugin(DataPlugin):
                     )
                 limit = arguments.get("limit", 100)
                 filters = arguments.get("filters") or {}
-                dataset_index = arguments.get("dataset_index", 0)
-                resource_index = arguments.get("resource_index", 0)
+                dataset_index = arguments.get("dataset_index")
+                resource_index = arguments.get("resource_index")
                 composite = await self.search_and_query(
                     query=query,
                     limit=limit,
@@ -667,7 +712,26 @@ class CKANPlugin(DataPlugin):
         if filters:
             params["filters"] = filters
 
-        response = await self._call_ckan_api("datastore_search", params)
+        try:
+            response = await self._call_ckan_api("datastore_search", params)
+        except RuntimeError as e:
+            msg = str(e)
+            # 404 from datastore_search almost always means the resource UUID
+            # is real but isn't loaded into the queryable Postgres datastore
+            # (datastore_active=false). Surface that explicitly so callers
+            # don't keep retrying with the same UUID.
+            if "404" in msg or "not found" in msg.lower():
+                raise RuntimeError(
+                    f"{msg}\n"
+                    "Hint: this resource may exist as a file download "
+                    "(GeoJSON/KML/SHP/PDF) but not be loaded into the "
+                    "datastore (datastore_active=false). Call "
+                    "ckan__get_dataset on the parent dataset to find a "
+                    "QUERYABLE resource (typically the CSV one), or use "
+                    "ckan__search_and_query, which auto-picks the "
+                    "datastore-loaded resource."
+                ) from e
+            raise
         return response.get("result", {}).get("records", [])
 
     async def get_schema(self, resource_id: str) -> Dict[str, Any]:
@@ -805,21 +869,29 @@ class CKANPlugin(DataPlugin):
         query: str,
         limit: int = 100,
         filters: Optional[Dict[str, Any]] = None,
-        dataset_index: int = 0,
-        resource_index: int = 0,
+        dataset_index: Optional[int] = None,
+        resource_index: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Search for a dataset and immediately query its first resource.
+        """Search for a dataset and immediately query its first queryable resource.
 
         Combines search_datasets + query_data into one server-side step so
         callers don't have to extract a resource_id from a previous response.
+
+        Picks the first resource where datastore_active=true (skipping
+        download-only resources like GeoJSON/KML/SHP/PDF). When the caller
+        leaves dataset_index/resource_index unset, walks the search results
+        until one with a queryable resource is found.
 
         Returns:
             Dict with either {"error": True, "message": ...} or
             {"dataset": {...}, "resource": {...}, "records": [...]}.
         """
+        explicit_dataset = dataset_index is not None
+        explicit_resource = resource_index is not None
+        ds_idx = dataset_index or 0
         # Cap how many search results we fetch so dataset_index can pick a
         # non-best match without an unbounded scan.
-        search_rows = max(dataset_index + 1, 5)
+        search_rows = max(ds_idx + 1, 10)
         datasets = await self.search_datasets(query, limit=search_rows)
         if not datasets:
             return {
@@ -830,45 +902,99 @@ class CKANPlugin(DataPlugin):
                 ),
             }
 
-        if dataset_index < 0 or dataset_index >= len(datasets):
+        if explicit_dataset:
+            if ds_idx < 0 or ds_idx >= len(datasets):
+                return {
+                    "error": True,
+                    "message": (
+                        f"dataset_index {ds_idx} is out of range "
+                        f"(found {len(datasets)} dataset(s))."
+                    ),
+                }
+            candidate_indices = [ds_idx]
+        else:
+            # Auto-walk: try the best match first, fall through to the next
+            # datasets if it has no queryable resource.
+            candidate_indices = list(range(len(datasets)))
+
+        chosen_dataset: Optional[Dict[str, Any]] = None
+        chosen_resource: Optional[Dict[str, Any]] = None
+        skipped_summary: List[str] = []
+
+        for idx in candidate_indices:
+            ds = datasets[idx]
+            resources = ds.get("resources") or []
+            if not resources:
+                skipped_summary.append(
+                    f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                    "no resources"
+                )
+                continue
+
+            if explicit_resource:
+                if resource_index < 0 or resource_index >= len(resources):
+                    return {
+                        "error": True,
+                        "message": (
+                            f"resource_index {resource_index} is out of "
+                            f"range for dataset {ds.get('id')!r} "
+                            f"(has {len(resources)} resource(s))."
+                        ),
+                    }
+                resource = resources[resource_index]
+                if not self._is_queryable(resource):
+                    return {
+                        "error": True,
+                        "message": (
+                            f"resource_index {resource_index} of dataset "
+                            f"{ds.get('id')!r} has datastore_active=false "
+                            "(download-only). Pick a different "
+                            "resource_index, or omit it to auto-pick the "
+                            "queryable one."
+                        ),
+                    }
+                chosen_dataset, chosen_resource = ds, resource
+                break
+
+            queryable = self._first_queryable_resource(ds)
+            if queryable:
+                chosen_dataset, chosen_resource = ds, queryable
+                break
+
+            formats = sorted(
+                {
+                    (r.get("format") or "?").upper()
+                    for r in resources
+                }
+            )
+            skipped_summary.append(
+                f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                f"no datastore-loaded resource (formats: {', '.join(formats)})"
+            )
+
+        if chosen_dataset is None or chosen_resource is None:
+            details = (
+                "\n".join(skipped_summary)
+                if skipped_summary
+                else "  (no datasets inspected)"
+            )
             return {
                 "error": True,
                 "message": (
-                    f"dataset_index {dataset_index} is out of range "
-                    f"(found {len(datasets)} dataset(s))."
+                    f"No queryable (datastore_active) resource found among "
+                    f"{len(datasets)} matching dataset(s) for query "
+                    f"{query!r}.\nSkipped:\n{details}\nTry a different "
+                    "keyword or call ckan__get_dataset to inspect resources."
                 ),
             }
 
-        chosen_dataset = datasets[dataset_index]
-        resources = chosen_dataset.get("resources") or []
-        if not resources:
-            return {
-                "error": True,
-                "message": (
-                    f"Dataset {chosen_dataset.get('id')!r} has no resources. "
-                    f"Try a different dataset_index or call ckan__get_dataset "
-                    f"to inspect available resources."
-                ),
-            }
-
-        if resource_index < 0 or resource_index >= len(resources):
-            return {
-                "error": True,
-                "message": (
-                    f"resource_index {resource_index} is out of range for "
-                    f"dataset {chosen_dataset.get('id')!r} "
-                    f"(has {len(resources)} resource(s))."
-                ),
-            }
-
-        chosen_resource = resources[resource_index]
         resource_id = chosen_resource.get("id")
         if not resource_id:
             return {
                 "error": True,
                 "message": (
-                    f"Resource at index {resource_index} of dataset "
-                    f"{chosen_dataset.get('id')!r} has no id."
+                    f"Chosen resource of dataset {chosen_dataset.get('id')!r}"
+                    " has no id."
                 ),
             }
 
@@ -915,12 +1041,11 @@ class CKANPlugin(DataPlugin):
         suggested_resource_id: Optional[str] = None
         suggested_dataset_id: Optional[str] = None
         for ds in datasets:
-            resources = ds.get("resources") or []
-            if resources:
-                suggested_resource_id = resources[0].get("id")
+            queryable = self._first_queryable_resource(ds)
+            if queryable and queryable.get("id"):
+                suggested_resource_id = queryable.get("id")
                 suggested_dataset_id = ds.get("id")
-                if suggested_resource_id:
-                    break
+                break
 
         lines: List[str] = []
         if suggested_resource_id:
@@ -930,7 +1055,10 @@ class CKANPlugin(DataPlugin):
                     f"suggested_resource_id: {suggested_resource_id}",
                     "suggested_next_tool: ckan__query_data",
                     f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
-                    "(or use ckan__search_and_query for a one-call keyword-to-data flow)",
+                    "(this is the datastore-loaded resource — only such "
+                    "resources can be queried; others are file downloads.)",
+                    "(or use ckan__search_and_query for a one-call "
+                    "keyword-to-data flow.)",
                     "===================================",
                     "",
                 ]
@@ -939,8 +1067,11 @@ class CKANPlugin(DataPlugin):
             lines.extend(
                 [
                     "=== NEXT STEP ===",
-                    "No resource UUIDs were attached to these datasets. Call "
-                    "ckan__get_dataset with a dataset_id below to look them up.",
+                    "None of the matched datasets have a queryable resource "
+                    "(datastore_active=true). The attached resources are "
+                    "file downloads only. Try a different search keyword, "
+                    "or call ckan__get_dataset to inspect non-datastore "
+                    "resources.",
                     "=================",
                     "",
                 ]
@@ -959,13 +1090,24 @@ class CKANPlugin(DataPlugin):
                 else "No description"
             )
             resources = dataset.get("resources") or []
-            first_resource_id = resources[0].get("id") if resources else None
+            queryable = self._first_queryable_resource(dataset)
+            queryable_id = queryable.get("id") if queryable else None
+            queryable_format = queryable.get("format") if queryable else None
 
             lines.append(f"{i}. {title}")
             lines.append(f"   dataset_id: {dataset_id}")
-            if first_resource_id:
+            if queryable_id:
+                fmt = f" [{queryable_format}]" if queryable_format else ""
                 lines.append(
-                    f"   resource_id (use this with ckan__query_data): {first_resource_id}"
+                    f"   resource_id (use this with ckan__query_data){fmt}: "
+                    f"{queryable_id}"
+                )
+            elif resources:
+                lines.append(
+                    f"   resource_id: NONE QUERYABLE — this dataset has "
+                    f"{len(resources)} resource(s) but none are loaded into "
+                    "the datastore (datastore_active=false). Use "
+                    "ckan__get_dataset for download URLs."
                 )
             lines.append(f"   Description: {notes}")
             lines.append(
@@ -992,9 +1134,8 @@ class CKANPlugin(DataPlugin):
         organization = dataset.get("organization", {}).get("title", "Unknown")
         resources = dataset.get("resources", []) or []
 
-        suggested_resource_id = (
-            resources[0].get("id") if resources else None
-        )
+        queryable = self._first_queryable_resource(dataset)
+        suggested_resource_id = queryable.get("id") if queryable else None
 
         lines: List[str] = []
         if suggested_resource_id:
@@ -1004,7 +1145,21 @@ class CKANPlugin(DataPlugin):
                     f"suggested_resource_id: {suggested_resource_id}",
                     "suggested_next_tool: ckan__query_data",
                     f"suggested_call: ckan__query_data(resource_id=\"{suggested_resource_id}\")",
+                    "(this is the datastore-loaded resource; the others are "
+                    "file downloads only.)",
                     "===================================",
+                    "",
+                ]
+            )
+        elif resources:
+            lines.extend(
+                [
+                    "=== NEXT STEP ===",
+                    f"This dataset has {len(resources)} resource(s) but none "
+                    "are loaded into the datastore (datastore_active=false), "
+                    "so ckan__query_data will not work on them. They are "
+                    "file downloads — see URLs below.",
+                    "=================",
                     "",
                 ]
             )
@@ -1027,11 +1182,22 @@ class CKANPlugin(DataPlugin):
                 res_name = resource.get("name", "Unnamed")
                 res_id = resource.get("id", "unknown")
                 res_format = resource.get("format", "unknown")
-                lines.append(f"  {i}. {res_name} ({res_format})")
+                res_url = resource.get("url", "")
+                queryable_flag = self._is_queryable(resource)
+                marker = "QUERYABLE" if queryable_flag else "DOWNLOAD-ONLY"
+                lines.append(f"  {i}. [{marker}] {res_name} ({res_format})")
                 lines.append(f"     resource_id: {res_id}")
-                lines.append(
-                    f"     Use ckan__query_data with resource_id=\"{res_id}\" to fetch rows."
-                )
+                if queryable_flag:
+                    lines.append(
+                        f"     Use ckan__query_data with resource_id=\"{res_id}\" to fetch rows."
+                    )
+                else:
+                    if res_url:
+                        lines.append(f"     download_url: {res_url}")
+                    lines.append(
+                        "     (not loaded into datastore — ckan__query_data "
+                        "will return 404 for this resource_id)"
+                    )
         else:
             lines.append(
                 "No resources available for this dataset. Try a different "
