@@ -610,12 +610,16 @@ class CKANPlugin(DataPlugin):
             if tool_name == "search_datasets":
                 query = arguments.get("query", "")
                 limit = arguments.get("limit", 20)
-                datasets = await self.search_datasets(query, limit)
+                datasets, total = await self._search_datasets_with_count(
+                    query, limit
+                )
                 return ToolResult(
                     content=[
                         {
                             "type": "text",
-                            "text": self._format_search_results(datasets),
+                            "text": self._format_search_results(
+                                datasets, total=total, limit=limit
+                            ),
                         }
                     ],
                     success=True,
@@ -712,7 +716,10 @@ class CKANPlugin(DataPlugin):
                 # Format SQL results
                 records = result.get("records", [])
                 fields = result.get("fields", [])
-                formatted_text = self._format_sql_results(records, fields)
+                effective_limit = result.get("effective_limit")
+                formatted_text = self._format_sql_results(
+                    records, fields, effective_limit=effective_limit
+                )
                 return ToolResult(
                     content=[{"type": "text", "text": formatted_text}],
                     success=True,
@@ -790,7 +797,9 @@ class CKANPlugin(DataPlugin):
                         error_message=result.get("message", "Aggregation failed"),
                     )
                 formatted = self._format_sql_results(
-                    result.get("records", []), result.get("fields", [])
+                    result.get("records", []),
+                    result.get("fields", []),
+                    effective_limit=result.get("effective_limit"),
                 )
                 return ToolResult(
                     content=[{"type": "text", "text": formatted}], success=True
@@ -821,12 +830,29 @@ class CKANPlugin(DataPlugin):
             limit: Maximum number of results
 
         Returns:
-            List of dataset metadata dictionaries
+            List of dataset metadata dictionaries (count-aware variant is
+            ``_search_datasets_with_count``).
         """
+        datasets, _count = await self._search_datasets_with_count(query, limit)
+        return datasets
+
+    async def _search_datasets_with_count(
+        self, query: str, limit: int = 20
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Same as search_datasets but also returns CKAN's `count` — the
+        true number of datasets matching the query, regardless of the row
+        cap. Lets the formatter say "20 of 47 matching datasets returned"
+        instead of just "Found 20"."""
         response = await self._call_ckan_api(
             "package_search", {"q": query, "rows": limit}
         )
-        return response.get("result", {}).get("results", [])
+        result = response.get("result", {})
+        count_val = result.get("count")
+        try:
+            count = int(count_val) if count_val is not None else None
+        except (TypeError, ValueError):
+            count = None
+        return result.get("results", []), count
 
     async def get_dataset(self, dataset_id: str) -> Dict[str, Any]:
         """Get detailed metadata for a specific dataset.
@@ -1045,7 +1071,8 @@ class CKANPlugin(DataPlugin):
             sql: PostgreSQL SELECT statement
 
         Returns:
-            Dictionary with success flag, records, fields, or error message
+            Dictionary with success flag, records, fields, effective_limit,
+            or error message
         """
         # Validate SQL
         is_valid, error = SQLValidator.validate_query(sql)
@@ -1054,6 +1081,7 @@ class CKANPlugin(DataPlugin):
 
         # Bound upstream scan cost: append LIMIT if the caller didn't set one.
         sql = SQLValidator.enforce_row_limit(sql)
+        effective_limit = SQLValidator.extract_top_level_limit(sql)
 
         # Log SQL execution (truncated for security)
         logger.info("Executing SQL", extra={"sql": sql[:500]})
@@ -1070,6 +1098,7 @@ class CKANPlugin(DataPlugin):
                 "success": True,
                 "records": result.get("result", {}).get("records", []),
                 "fields": result.get("result", {}).get("fields", []),
+                "effective_limit": effective_limit,
             }
         except Exception as e:
             logger.error(f"SQL execution failed: {e}", exc_info=True)
@@ -1404,7 +1433,12 @@ class CKANPlugin(DataPlugin):
             logger.error(f"Health check failed: {e}")
             return False
 
-    def _format_search_results(self, datasets: List[Dict[str, Any]]) -> str:
+    def _format_search_results(
+        self,
+        datasets: List[Dict[str, Any]],
+        total: Optional[int] = None,
+        limit: int = 20,
+    ) -> str:
         """Format search results for user display."""
         if not datasets:
             return f"No datasets found in {self.plugin_config.city_name}'s open data portal."
@@ -1448,9 +1482,25 @@ class CKANPlugin(DataPlugin):
                 ]
             )
 
-        lines.append(
-            f"Found {len(datasets)} dataset(s) in {self.plugin_config.city_name}'s open data portal:\n"
-        )
+        # Lead with the X-of-Y framing so the model can't mistake the
+        # results-shown count for the count of matching datasets.
+        n_returned = len(datasets)
+        if total is not None and total > n_returned:
+            lines.append(
+                f"{n_returned} of {total} matching dataset(s) shown "
+                f"(limit={limit}; raise limit to see more) in "
+                f"{self.plugin_config.city_name}'s open data portal:\n"
+            )
+        elif total is not None:
+            lines.append(
+                f"{total} matching dataset(s) (full result, limit={limit}) "
+                f"in {self.plugin_config.city_name}'s open data portal:\n"
+            )
+        else:
+            lines.append(
+                f"{n_returned} dataset(s) in "
+                f"{self.plugin_config.city_name}'s open data portal:\n"
+            )
 
         for i, dataset in enumerate(datasets, 1):
             title = dataset.get("title", "Untitled")
@@ -1604,22 +1654,11 @@ class CKANPlugin(DataPlugin):
             lines.append(truncated_warning)
             lines.append("")
 
-        # Header line: prefer "true total" wording when known, since the
-        # model has consistently been mistaking len(records) for the total.
-        if total is not None and total != n_returned:
-            lines.append(
-                f"total_matching_rows: {total} (returned {n_returned}, "
-                f"limit={limit})\n"
-            )
-        elif total is not None:
-            lines.append(
-                f"total_matching_rows: {total} (limit={limit})\n"
-            )
-        else:
-            lines.append(
-                f"returned_rows: {n_returned} (limit={limit}, "
-                "total unknown — see warning above if any)\n"
-            )
+        # Header line: lead with the X-of-Y framing so the model can't
+        # mistake the rows-returned count for the answer to a counting
+        # question.
+        lines.append(self._format_count_header(n_returned, limit, total))
+        lines.append("")
 
         # Show first few records as examples
         for i, record in enumerate(records[:5], 1):
@@ -1638,6 +1677,31 @@ class CKANPlugin(DataPlugin):
             lines.append(schema_footer)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_count_header(
+        n_returned: int,
+        limit: int,
+        total: Optional[int],
+        unit: str = "rows",
+    ) -> str:
+        """One-line "X of Y" summary used at the top of every row-returning
+        response. The model has been mistaking returned-rows for true count;
+        this phrasing makes the partial/total distinction unambiguous."""
+        if total is not None and total > n_returned:
+            return (
+                f"{n_returned} of {total} {unit} returned "
+                f"(limit={limit}; raise limit or use ckan__aggregate_data "
+                "for full count)."
+            )
+        if total is not None:
+            # total == n_returned, all rows returned
+            return f"{total} {unit} returned (full result, limit={limit})."
+        # total unknown
+        return (
+            f"{n_returned} {unit} returned (limit={limit}, "
+            "true total unknown — see TRUNCATED warning above if any)."
+        )
 
     def _format_truncation_block(
         self,
@@ -1747,20 +1811,7 @@ class CKANPlugin(DataPlugin):
         resource_name = resource.get("name", "Unnamed")
         n_returned = len(records)
 
-        # Total line: prefer "true total" so the model can't read the
-        # returned-rows count as the answer to a counting question.
-        if total is not None and total != n_returned:
-            count_line = (
-                f"total_matching_rows: {total} "
-                f"(returned {n_returned}, limit={limit})"
-            )
-        elif total is not None:
-            count_line = f"total_matching_rows: {total} (limit={limit})"
-        else:
-            count_line = (
-                f"returned_rows: {n_returned} "
-                f"(limit={limit}, total unknown)"
-            )
+        count_line = self._format_count_header(n_returned, limit, total)
 
         lines: List[str] = []
         truncated_warning = self._format_truncation_block(
@@ -1789,11 +1840,13 @@ class CKANPlugin(DataPlugin):
                 "dataset/resource (see alternates below)."
             )
         else:
-            preview_caption = (
-                f"Showing first 5 of {n_returned} returned"
-                + (f" (true total: {total})" if total is not None else "")
-                + ":"
-            )
+            if total is not None and total > n_returned:
+                preview_caption = (
+                    f"Showing first 5 of {n_returned} returned "
+                    f"(true total: {total}):"
+                )
+            else:
+                preview_caption = f"Showing first 5 of {n_returned} returned:"
             lines.append(preview_caption)
             for i, record in enumerate(records[:5], 1):
                 lines.append(f"Record {i}:")
@@ -1858,21 +1911,59 @@ class CKANPlugin(DataPlugin):
         return "\n".join(lines)
 
     def _format_sql_results(
-        self, records: List[Dict[str, Any]], fields: List[Dict[str, Any]]
+        self,
+        records: List[Dict[str, Any]],
+        fields: List[Dict[str, Any]],
+        effective_limit: Optional[int] = None,
     ) -> str:
         """Format SQL query results for user display.
 
         Args:
             records: List of record dictionaries
             fields: List of field metadata dictionaries
+            effective_limit: The LIMIT clause that was actually executed —
+                either user-supplied or the enforced default. Used to
+                detect truncation: if len(records) >= effective_limit, the
+                result was almost certainly capped.
 
         Returns:
             Formatted string representation of results
         """
-        if not records:
-            return "No records found matching the SQL query."
+        n_returned = len(records)
 
-        lines = [f"SQL Query Results: {len(records)} record(s)\n"]
+        # Heuristic truncation detection — datastore_search_sql doesn't
+        # return a "total"; the only signal is "did we hit our LIMIT?"
+        truncation_block = ""
+        if effective_limit is not None and n_returned >= effective_limit:
+            truncation_block = (
+                "=== MAY BE TRUNCATED ===\n"
+                f"This SQL returned exactly the LIMIT ({effective_limit}) "
+                "rows. The true total could not be determined from "
+                "datastore_search_sql alone. For counting questions, do "
+                f"NOT report {n_returned} as the answer — instead run a "
+                "separate SELECT COUNT(*) with the same WHERE clause, or "
+                "use ckan__aggregate_data with metrics="
+                '{"count": "count(*)"}.\n'
+                "========================"
+            )
+
+        if not records:
+            text = "No records found matching the SQL query."
+            return f"{truncation_block}\n\n{text}" if truncation_block else text
+
+        lines: List[str] = []
+        if truncation_block:
+            lines.append(truncation_block)
+            lines.append("")
+
+        # Header — total is unknown for raw SQL, so show "X rows returned".
+        if effective_limit is not None:
+            lines.append(
+                f"{n_returned} rows returned (limit={effective_limit}, "
+                "true total unknown — see warning above if any).\n"
+            )
+        else:
+            lines.append(f"{n_returned} rows returned.\n")
 
         # Show field names if available
         if fields:
@@ -1887,7 +1978,7 @@ class CKANPlugin(DataPlugin):
                     lines.append(f"  {key}: {value}")
             lines.append("")
 
-        if len(records) > 10:
-            lines.append(f"... and {len(records) - 10} more record(s)")
+        if n_returned > 10:
+            lines.append(f"... and {n_returned - 10} more record(s) returned")
 
         return "\n".join(lines)

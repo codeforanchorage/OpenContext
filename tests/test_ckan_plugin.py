@@ -545,6 +545,123 @@ class TestExecuteTool:
             assert "required" in result.error_message.lower()
 
     @pytest.mark.asyncio
+    async def test_execute_tool_search_datasets_surfaces_total_count(
+        self, ckan_config
+    ):
+        """search_datasets reads CKAN's `count` and renders X-of-Y."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "count": 47,
+                    "results": [
+                        {"id": f"d{i}", "title": f"Dataset {i}", "resources": []}
+                        for i in range(20)
+                    ],
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_search]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_datasets", {"query": "parks", "limit": 20}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "20 of 47 matching dataset(s) shown" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_execute_sql_truncated_warning(self, ckan_config):
+        """execute_sql warns when len(records) hits the LIMIT clause."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_sql = Mock()
+            mock_response_sql.json.return_value = {
+                "result": {
+                    "records": [{"_id": i, "x": i} for i in range(100)],
+                    "fields": [{"id": "x", "type": "int"}],
+                }
+            }
+            mock_response_sql.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_sql]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "execute_sql",
+                {
+                    "sql": (
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
+                        "LIMIT 100"
+                    )
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "MAY BE TRUNCATED" in text
+            assert "ckan__aggregate_data" in text or "COUNT(*)" in text
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_execute_sql_no_warning_under_limit(
+        self, ckan_config
+    ):
+        """execute_sql does not warn when fewer rows returned than LIMIT."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_sql = Mock()
+            mock_response_sql.json.return_value = {
+                "result": {
+                    "records": [{"_id": i, "x": i} for i in range(7)],
+                    "fields": [{"id": "x", "type": "int"}],
+                }
+            }
+            mock_response_sql.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_sql]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "execute_sql",
+                {
+                    "sql": (
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
+                        "LIMIT 100"
+                    )
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "TRUNCATED" not in text
+            assert "7 rows returned" in text
+
+    @pytest.mark.asyncio
     async def test_execute_tool_search_and_query_succeeds(self, ckan_config):
         """search_and_query returns rows from the first resource of the first match."""
         plugin = CKANPlugin(ckan_config)
@@ -1208,7 +1325,7 @@ class TestExecuteTool:
 
             assert result.success is True
             text = result.content[0]["text"]
-            assert "total_matching_rows: 531" in text
+            assert "100 of 531" in text
             assert "TRUNCATED" in text
             assert "the answer is 531, NOT 100" in text
             assert "ckan__aggregate_data" in text
@@ -1250,7 +1367,7 @@ class TestExecuteTool:
 
             assert result.success is True
             text = result.content[0]["text"]
-            assert "total_matching_rows: 85" in text
+            assert "85 rows returned" in text
             assert "TRUNCATED" not in text
 
     @pytest.mark.asyncio
@@ -1313,7 +1430,7 @@ class TestExecuteTool:
 
             assert result.success is True
             text = result.content[0]["text"]
-            assert "total_matching_rows: 531" in text
+            assert "100 of 531" in text
             assert "TRUNCATED" in text
             assert "the answer is 531, NOT 100" in text
             # Follow-up COUNT(*) actually issued
@@ -1361,7 +1478,7 @@ class TestExecuteTool:
 
             assert result.success is True
             text = result.content[0]["text"]
-            assert "total_matching_rows: 85" in text
+            assert "85 rows returned" in text
             assert "TRUNCATED" not in text
             # init + SELECT only, no COUNT(*)
             assert mock_client.post.call_count == 2

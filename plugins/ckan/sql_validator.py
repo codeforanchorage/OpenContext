@@ -160,6 +160,38 @@ class SQLValidator:
         return True, None
 
     @classmethod
+    def extract_top_level_limit(cls, sql: str) -> Optional[int]:
+        """Return the integer LIMIT of the outermost statement, or None
+        if there isn't one (or it can't be parsed). Subquery / CTE limits
+        are ignored — same scoping rules as ``enforce_row_limit``.
+
+        Used by callers to detect truncation: if a SELECT returned the
+        same number of rows as the effective top-level LIMIT, the result
+        is almost certainly capped."""
+        try:
+            parsed = sqlparse.parse(sql)
+        except Exception:
+            return None
+        if not parsed:
+            return None
+        statement = parsed[0]
+        # Walk top-level tokens for a LIMIT keyword followed by an integer.
+        toks = [t for t in statement.tokens if not isinstance(t, Parenthesis)]
+        for i, tok in enumerate(toks):
+            if tok.ttype in Keyword and tok.normalized.upper() == "LIMIT":
+                # next non-whitespace token should be the integer literal
+                for nxt in toks[i + 1 :]:
+                    if nxt.is_whitespace:
+                        continue
+                    text = nxt.value.strip().rstrip(";")
+                    try:
+                        return int(text)
+                    except (TypeError, ValueError):
+                        return None
+                return None
+        return None
+
+    @classmethod
     def enforce_row_limit(cls, sql: str) -> str:
         """Append ``LIMIT`` to an already-validated query if it lacks one.
 

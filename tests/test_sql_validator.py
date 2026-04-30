@@ -804,6 +804,49 @@ class TestSafeSQLBuilderOrderAndLimit:
             SafeSQLBuilder.clamp_limit(bad)
 
 
+class TestExtractTopLevelLimit:
+    UUID = "11111111-2222-3333-4444-555555555555"
+
+    def test_simple_limit(self):
+        assert (
+            SQLValidator.extract_top_level_limit(
+                f'SELECT * FROM "{self.UUID}" LIMIT 50'
+            )
+            == 50
+        )
+
+    def test_limit_with_trailing_semicolon(self):
+        assert (
+            SQLValidator.extract_top_level_limit(
+                f'SELECT * FROM "{self.UUID}" LIMIT 100;'
+            )
+            == 100
+        )
+
+    def test_no_limit_returns_none(self):
+        assert (
+            SQLValidator.extract_top_level_limit(f'SELECT * FROM "{self.UUID}"')
+            is None
+        )
+
+    def test_subquery_limit_ignored(self):
+        # Top-level statement has no LIMIT; the subquery's LIMIT does
+        # not count.
+        sql = (
+            f'SELECT * FROM (SELECT * FROM "{self.UUID}" LIMIT 5) sub '
+        )
+        assert SQLValidator.extract_top_level_limit(sql) is None
+
+    def test_after_enforce_row_limit(self):
+        sql = SQLValidator.enforce_row_limit(
+            f'SELECT * FROM "{self.UUID}"'
+        )
+        assert (
+            SQLValidator.extract_top_level_limit(sql)
+            == SQLValidator.DEFAULT_ROW_LIMIT
+        )
+
+
 class TestSafeSQLBuilderResourceId:
     def test_valid_uuid(self):
         uuid = "11111111-2222-3333-4444-555555555555"
