@@ -751,6 +751,222 @@ class TestExecuteTool:
             )
 
     @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_resource_name_picks_archive(
+        self, ckan_config
+    ):
+        """Boston-style regression: a 311 dataset with a rolling NEW SYSTEM
+        plus per-year archives. resource_name='2020' must pick the 2020
+        archive, not the first datastore_active resource."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "dataset-311",
+                            "title": "311 Service Requests",
+                            "resources": [
+                                {
+                                    "id": "new-uuid",
+                                    "name": "311 Service Requests - NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "2020-uuid",
+                                    "name": "311 SERVICE REQUESTS - 2020",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "2021-uuid",
+                                    "name": "311 SERVICE REQUESTS - 2021",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "case_id": "X-2020"}],
+                    "fields": [{"id": "case_id", "type": "text"}],
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {"query": "311", "resource_name": "2020"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Picked the 2020 archive (case-insensitive substring on name)
+            assert "2020-uuid" in text
+            assert "X-2020" in text
+            # Sibling block surfaces the other queryable resources
+            assert "Other queryable resources in this dataset" in text
+            assert "311 Service Requests - NEW SYSTEM" in text
+            assert "311 SERVICE REQUESTS - 2021" in text
+            # And the third call's body actually queried 2020-uuid
+            third_call = mock_client.post.call_args_list[2]
+            assert third_call[1]["json"]["resource_id"] == "2020-uuid"
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_resource_name_no_match_errors(
+        self, ckan_config
+    ):
+        """resource_name with no match returns a clean error listing names."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "dataset-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "new-uuid",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[mock_response_init, mock_response_search]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {
+                    "query": "311",
+                    "resource_name": "1999",
+                    "dataset_index": 0,
+                },
+            )
+
+            assert result.success is False
+            err = result.error_message or ""
+            assert "1999" in err
+            assert "NEW SYSTEM" in err
+
+    @pytest.mark.asyncio
+    async def test_execute_tool_search_and_query_siblings_block_lists_archives(
+        self, ckan_config
+    ):
+        """Siblings block lists every queryable resource of the chosen
+        dataset other than the chosen one — even when resource_name is
+        not used."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "new",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2025",
+                                    "name": "311 - 2025",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2024",
+                                    "name": "311 - 2024",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "geojson",
+                                    "name": "GeoJSON",
+                                    "format": "GeoJSON",
+                                    "datastore_active": False,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {"records": [{"_id": 1}], "fields": []}
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "311"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "Other queryable resources in this dataset" in text
+            assert "311 - 2025" in text
+            assert "311 - 2024" in text
+            # Only QUERYABLE siblings — the GeoJSON should not appear
+            # in the siblings block
+            assert "GeoJSON" not in text.split(
+                "Other queryable resources in this dataset"
+            )[1]
+
+    @pytest.mark.asyncio
     async def test_execute_tool_search_and_query_walks_to_next_dataset(
         self, ckan_config
     ):

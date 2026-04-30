@@ -491,8 +491,20 @@ class CKANPlugin(DataPlugin):
                     "resource, plus a 'Filterable columns' footer listing "
                     "the schema (so you can refine with `where` or pivot "
                     "to `ckan__execute_sql` for joins/CTEs/window funcs), "
-                    "plus a header showing which dataset and resource "
-                    "were used."
+                    "an 'Other queryable resources in this dataset' "
+                    "block listing siblings (e.g. per-year archives), "
+                    "and a header showing which dataset and resource "
+                    "were used.\n\n"
+                    "MULTI-RESOURCE DATASETS: a single dataset can hold "
+                    "many queryable resources. Boston's 311 dataset has "
+                    "22 (a rolling 'NEW SYSTEM' view plus per-year "
+                    "archives 2011–2026). Use `resource_name` to pick a "
+                    "specific one — e.g. resource_name=\"2020\" picks "
+                    "'311 Service Requests - 2020'. If you don't pass "
+                    "`resource_name`, the first datastore-loaded "
+                    "resource is used (which is typically the rolling "
+                    "current view, NOT historical archives — so older "
+                    "questions need `resource_name`)."
                 ),
                 input_schema={
                     "type": "object",
@@ -552,7 +564,28 @@ class CKANPlugin(DataPlugin):
                                 "to query. If omitted, auto-picks the "
                                 "first datastore_active resource (Boston "
                                 "datasets typically attach 5–7 resources "
-                                "but only the CSV is queryable)."
+                                "but only the CSV is queryable). "
+                                "`resource_name` takes precedence."
+                            ),
+                        },
+                        "resource_name": {
+                            "type": "string",
+                            "description": (
+                                "Case-insensitive substring match on a "
+                                "resource's `name`. Use this to pick a "
+                                "specific archive when a dataset has "
+                                "multiple queryable resources (e.g. "
+                                "Boston's 311 dataset has per-year "
+                                "archives '311 Service Requests - 2020', "
+                                "'... - 2021', etc., plus a rolling "
+                                "'NEW SYSTEM'). Examples: "
+                                "resource_name=\"2020\" picks the 2020 "
+                                "archive; resource_name=\"NEW SYSTEM\" "
+                                "picks the rolling current view. The "
+                                "alternates list in any prior "
+                                "search_and_query response shows "
+                                "available names. Takes precedence over "
+                                "`resource_index`."
                             ),
                         },
                     },
@@ -698,6 +731,7 @@ class CKANPlugin(DataPlugin):
                 where = arguments.get("where") or None
                 dataset_index = arguments.get("dataset_index")
                 resource_index = arguments.get("resource_index")
+                resource_name = arguments.get("resource_name")
                 composite = await self.search_and_query(
                     query=query,
                     limit=limit,
@@ -705,6 +739,7 @@ class CKANPlugin(DataPlugin):
                     where=where,
                     dataset_index=dataset_index,
                     resource_index=resource_index,
+                    resource_name=resource_name,
                 )
                 if composite.get("error"):
                     return ToolResult(
@@ -1045,6 +1080,34 @@ class CKANPlugin(DataPlugin):
 
         return await self.execute_sql(sql)
 
+    @staticmethod
+    def _queryable_resources(dataset: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """All datastore_active resources in a dataset, in package_show order."""
+        return [r for r in (dataset.get("resources") or []) if r.get("datastore_active")]
+
+    @classmethod
+    def _resource_by_name(
+        cls,
+        dataset: Dict[str, Any],
+        name_query: str,
+        queryable_only: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Pick the first resource whose `name` contains `name_query`
+        (case-insensitive substring)."""
+        if not name_query:
+            return None
+        needle = name_query.casefold()
+        candidates = (
+            cls._queryable_resources(dataset)
+            if queryable_only
+            else (dataset.get("resources") or [])
+        )
+        for r in candidates:
+            res_name = (r.get("name") or "").casefold()
+            if needle in res_name:
+                return r
+        return None
+
     async def search_and_query(
         self,
         query: str,
@@ -1053,16 +1116,18 @@ class CKANPlugin(DataPlugin):
         where: Optional[Dict[str, Any]] = None,
         dataset_index: Optional[int] = None,
         resource_index: Optional[int] = None,
+        resource_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Search for a dataset and immediately query its first queryable resource.
+        """Search for a dataset and immediately query a queryable resource.
 
         Combines search_datasets + query_data into one server-side step so
         callers don't have to extract a resource_id from a previous response.
 
-        Picks the first resource where datastore_active=true (skipping
-        download-only resources like GeoJSON/KML/SHP/PDF). When the caller
-        leaves dataset_index/resource_index unset, walks the search results
-        until one with a queryable resource is found.
+        Resource selection precedence (highest to lowest):
+          1. ``resource_name`` (substring match on resource ``name``).
+          2. ``resource_index`` (explicit position in the dataset's
+             resources array).
+          3. First ``datastore_active`` resource in the dataset.
 
         Returns:
             Dict with either {"error": True, "message": ...} or
@@ -1113,6 +1178,36 @@ class CKANPlugin(DataPlugin):
                 )
                 continue
 
+            # 1) name match wins if provided
+            if resource_name:
+                matched = self._resource_by_name(ds, resource_name)
+                if matched is not None:
+                    chosen_dataset, chosen_resource = ds, matched
+                    break
+                # Only error out if the user fixed the dataset too.
+                if explicit_dataset:
+                    queryable_names = [
+                        r.get("name") or "(unnamed)"
+                        for r in self._queryable_resources(ds)
+                    ]
+                    return {
+                        "error": True,
+                        "message": (
+                            f"No queryable resource in dataset "
+                            f"{ds.get('id')!r} has a name matching "
+                            f"{resource_name!r}. Available queryable "
+                            f"resource names: "
+                            f"{queryable_names or '(none)'}."
+                        ),
+                    }
+                # Otherwise fall through and try the next dataset.
+                skipped_summary.append(
+                    f"  [{idx}] {ds.get('title') or ds.get('id')}: "
+                    f"no resource name matching {resource_name!r}"
+                )
+                continue
+
+            # 2) explicit positional pick
             if explicit_resource:
                 if resource_index < 0 or resource_index >= len(resources):
                     return {
@@ -1138,6 +1233,7 @@ class CKANPlugin(DataPlugin):
                 chosen_dataset, chosen_resource = ds, resource
                 break
 
+            # 3) auto-pick the first queryable resource
             queryable = self._first_queryable_resource(ds)
             if queryable:
                 chosen_dataset, chosen_resource = ds, queryable
@@ -1153,6 +1249,24 @@ class CKANPlugin(DataPlugin):
                 f"  [{idx}] {ds.get('title') or ds.get('id')}: "
                 f"no datastore-loaded resource (formats: {', '.join(formats)})"
             )
+
+        # If we walked all datasets and resource_name was set but never
+        # matched, give a name-specific error rather than the generic
+        # "no queryable resource" one.
+        if (
+            chosen_dataset is None
+            and resource_name
+            and not explicit_dataset
+        ):
+            return {
+                "error": True,
+                "message": (
+                    f"No dataset in the {len(datasets)} matches for query "
+                    f"{query!r} has a queryable resource whose name "
+                    f"matches {resource_name!r}.\nSkipped:\n"
+                    + ("\n".join(skipped_summary) or "  (no datasets inspected)")
+                ),
+            }
 
         if chosen_dataset is None or chosen_resource is None:
             details = (
@@ -1511,6 +1625,27 @@ class CKANPlugin(DataPlugin):
         if schema_footer:
             lines.append("")
             lines.append(schema_footer)
+
+        # Sibling queryable resources within the SAME dataset. Boston's 311
+        # dataset has 22 (a rolling view + per-year archives back to 2011)
+        # — without this block the model can't see them.
+        sibling_queryables = self._queryable_resources(dataset)
+        chosen_resource_id = resource.get("id")
+        siblings = [
+            r for r in sibling_queryables if r.get("id") != chosen_resource_id
+        ]
+        if siblings:
+            lines.append("")
+            lines.append(
+                f"Other queryable resources in this dataset "
+                f"(pass resource_name=... to pick one):"
+            )
+            for r in siblings:
+                r_name = r.get("name") or "(unnamed)"
+                r_fmt = r.get("format") or "?"
+                r_id = r.get("id") or "?"
+                lines.append(f"  - {r_name} [{r_fmt}]")
+                lines.append(f"    resource_id: {r_id}")
 
         if len(alternates) > 1:
             lines.append("")
