@@ -588,6 +588,25 @@ class CKANPlugin(DataPlugin):
                                 "`resource_index`."
                             ),
                         },
+                        "include_resource_totals": {
+                            "type": "boolean",
+                            "description": (
+                                "When true, runs COUNT(*) in parallel "
+                                "against every queryable resource in the "
+                                "matched dataset and surfaces per-resource "
+                                "totals + a grand total in the response. "
+                                "Use this for dataset-wide counting "
+                                "questions ('total 311 requests ever', "
+                                "'how many permits across all years'). "
+                                "If a `where` clause is set, it's applied "
+                                "to each resource — be aware schemas can "
+                                "differ across per-year archives, so a "
+                                "where clause built for one resource may "
+                                "fail on others (those resources will "
+                                "show n=null). Default false (one query, "
+                                "fast path)."
+                            ),
+                        },
                     },
                     "required": ["query"],
                 },
@@ -739,6 +758,9 @@ class CKANPlugin(DataPlugin):
                 dataset_index = arguments.get("dataset_index")
                 resource_index = arguments.get("resource_index")
                 resource_name = arguments.get("resource_name")
+                include_resource_totals = bool(
+                    arguments.get("include_resource_totals", False)
+                )
                 composite = await self.search_and_query(
                     query=query,
                     limit=limit,
@@ -747,6 +769,7 @@ class CKANPlugin(DataPlugin):
                     dataset_index=dataset_index,
                     resource_index=resource_index,
                     resource_name=resource_name,
+                    include_resource_totals=include_resource_totals,
                 )
                 if composite.get("error"):
                     return ToolResult(
@@ -1219,6 +1242,7 @@ class CKANPlugin(DataPlugin):
         dataset_index: Optional[int] = None,
         resource_index: Optional[int] = None,
         resource_name: Optional[str] = None,
+        include_resource_totals: bool = False,
     ) -> Dict[str, Any]:
         """Search for a dataset and immediately query a queryable resource.
 
@@ -1237,6 +1261,14 @@ class CKANPlugin(DataPlugin):
         """
         explicit_dataset = dataset_index is not None
         explicit_resource = resource_index is not None
+        explicit_resource_name = bool(resource_name)
+        # The model auto-picked the resource (no resource_name, resource_index,
+        # or pinned dataset_index). Used by the formatter to decide whether to
+        # warn that the answer is for ONE of N queryable resources and might
+        # be partial relative to the user's "total" question.
+        auto_picked_resource = not (
+            explicit_resource or explicit_resource_name
+        )
         ds_idx = dataset_index or 0
         # Cap how many search results we fetch so dataset_index can pick a
         # non-best match without an unbounded scan.
@@ -1411,6 +1443,16 @@ class CKANPlugin(DataPlugin):
                 ),
             }
 
+        # Optional: parallel COUNT(*) across every queryable resource of the
+        # chosen dataset, so a multi-archive dataset like Boston's 311 can
+        # answer "total across all years" in one follow-up call instead of
+        # 22 sequential ones.
+        sibling_totals: Optional[Dict[str, Optional[int]]] = None
+        if include_resource_totals:
+            sibling_totals = await self._count_all_queryable(
+                chosen_dataset, where=where, filters=filters
+            )
+
         return {
             "dataset": chosen_dataset,
             "resource": chosen_resource,
@@ -1418,7 +1460,45 @@ class CKANPlugin(DataPlugin):
             "fields": fields,
             "total": total,
             "alternate_datasets": datasets,
+            "auto_picked_resource": auto_picked_resource,
+            "sibling_totals": sibling_totals,
         }
+
+    async def _count_all_queryable(
+        self,
+        dataset: Dict[str, Any],
+        where: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[int]]:
+        """Run COUNT(*) in parallel against every queryable resource of a
+        dataset. Returns a {resource_id: int_total or None} dict — a None
+        means the count failed for that resource (e.g. column doesn't exist
+        in that archive's schema, common when applying a `where` clause
+        that uses NEW SYSTEM column names against a per-year archive)."""
+        try:
+            where_sql = SafeSQLBuilder.build_where_clause(where) if where else ""
+        except ValueError:
+            where_sql = ""
+
+        async def count_one(resource: Dict[str, Any]) -> Tuple[str, Optional[int]]:
+            rid = resource.get("id") or ""
+            try:
+                validated_id = SafeSQLBuilder.validate_resource_id(rid)
+            except ValueError:
+                return rid, None
+            n = await self._count_via_sql(
+                validated_id, where_sql, filters
+            )
+            return rid, n
+
+        queryables = self._queryable_resources(dataset)
+        if not queryables:
+            return {}
+        import asyncio
+        results = await asyncio.gather(
+            *(count_one(r) for r in queryables), return_exceptions=False
+        )
+        return dict(results)
 
     async def health_check(self) -> bool:
         """Check if CKAN API is accessible.
@@ -1804,6 +1884,10 @@ class CKANPlugin(DataPlugin):
         fields = composite.get("fields", []) or []
         total = composite.get("total")
         alternates = composite.get("alternate_datasets", []) or []
+        auto_picked = bool(composite.get("auto_picked_resource"))
+        sibling_totals: Optional[Dict[str, Optional[int]]] = composite.get(
+            "sibling_totals"
+        )
 
         dataset_id = dataset.get("id", "unknown")
         dataset_title = dataset.get("title", "Untitled")
@@ -1814,6 +1898,42 @@ class CKANPlugin(DataPlugin):
         count_line = self._format_count_header(n_returned, limit, total)
 
         lines: List[str] = []
+
+        # PARTIAL warning fires when the model auto-picked one of N
+        # queryable resources. Without this, GPT-4o tends to read the
+        # one-resource answer as canonical and report it as the dataset
+        # total. (Pre-enhancement behavior was actually better here:
+        # the model was forced into search_datasets→get_dataset→iterate
+        # query_data, which surfaced all resources naturally.)
+        sibling_queryables = self._queryable_resources(dataset)
+        siblings = [
+            r for r in sibling_queryables if r.get("id") != resource_id
+        ]
+        if auto_picked and siblings:
+            n_total_resources = len(sibling_queryables)
+            partial_block = (
+                "=== PARTIAL DATASET ANSWER ===\n"
+                f"This dataset has {n_total_resources} queryable resources "
+                f"(e.g. a rolling current view + per-year archives). "
+                f"This response covers ONE of them: "
+                f"'{resource_name}'.\n\n"
+                "If the user's question was about a TOTAL across all "
+                "resources (e.g. 'how many ever', 'in total', "
+                "'across all years'), this answer is INCOMPLETE. Options:\n"
+                "  - Re-call ckan__search_and_query with "
+                "include_resource_totals=true to get a per-resource "
+                "row count breakdown in one call.\n"
+                "  - Pick a specific archive with resource_name=<...> "
+                "(e.g. resource_name=\"2018\").\n"
+                "  - Use ckan__execute_sql with UNION ALL across the "
+                "resource UUIDs listed below.\n"
+                "If the user's question was about RECENT data, this "
+                "rolling/current resource is likely fine.\n"
+                "==============================="
+            )
+            lines.append(partial_block)
+            lines.append("")
+
         truncated_warning = self._format_truncation_block(
             n_returned, limit, total
         )
@@ -1833,6 +1953,38 @@ class CKANPlugin(DataPlugin):
                 "",
             ]
         )
+
+        # When include_resource_totals=true was requested, lead with the
+        # cross-resource breakdown — this is the answer to "total"
+        # questions and should be the most prominent thing.
+        if sibling_totals is not None:
+            grand: Optional[int] = 0
+            per_resource_lines: List[str] = []
+            had_failure = False
+            # Order by package_show order (rolling view first, then
+            # per-year archives) so the model can read it sequentially.
+            for r in sibling_queryables:
+                rid = r.get("id") or ""
+                rname = r.get("name") or "(unnamed)"
+                n = sibling_totals.get(rid)
+                if n is None:
+                    per_resource_lines.append(f"  - {rname}: n=null (count failed)")
+                    had_failure = True
+                else:
+                    per_resource_lines.append(f"  - {rname}: {n}")
+                    if grand is not None:
+                        grand += n
+            grand_line = (
+                f"GRAND TOTAL across {len(sibling_queryables)} resources: "
+                f"{grand}"
+                + (" (some resources returned null — sum is partial)"
+                   if had_failure else "")
+            )
+            lines.append("=== Per-resource totals ===")
+            lines.append(grand_line)
+            lines.extend(per_resource_lines)
+            lines.append("===========================")
+            lines.append("")
 
         if not records:
             lines.append(
@@ -1864,17 +2016,15 @@ class CKANPlugin(DataPlugin):
 
         # Sibling queryable resources within the SAME dataset. Boston's 311
         # dataset has 22 (a rolling view + per-year archives back to 2011)
-        # — without this block the model can't see them.
-        sibling_queryables = self._queryable_resources(dataset)
-        chosen_resource_id = resource.get("id")
-        siblings = [
-            r for r in sibling_queryables if r.get("id") != chosen_resource_id
-        ]
-        if siblings:
+        # — without this block the model can't see them. Only render here
+        # if include_resource_totals=false; the per-resource-totals block
+        # above already lists everything with counts.
+        if siblings and sibling_totals is None:
             lines.append("")
             lines.append(
                 "Other queryable resources in this dataset "
-                "(pass resource_name=... to pick one):"
+                "(pass resource_name=... to pick one, or "
+                "include_resource_totals=true for a full breakdown):"
             )
             for r in siblings:
                 r_name = r.get("name") or "(unnamed)"

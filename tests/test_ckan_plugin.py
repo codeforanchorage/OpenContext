@@ -1084,6 +1084,240 @@ class TestExecuteTool:
             )[1]
 
     @pytest.mark.asyncio
+    async def test_search_and_query_emits_partial_warning_when_auto_picked(
+        self, ckan_config
+    ):
+        """When the model auto-picks a resource and queryable siblings
+        exist, the response must include a PARTIAL DATASET ANSWER block
+        — otherwise GPT-4o reads the one-resource count as the dataset
+        total. Regression test for: 'How many 311 requests in total?'
+        returning 9,790 (NEW SYSTEM) instead of walking 22 archives."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311 Service Requests",
+                            "resources": [
+                                {
+                                    "id": "new-uuid",
+                                    "name": "311 - NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2025",
+                                    "name": "311 - 2025",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2024",
+                                    "name": "311 - 2024",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1}],
+                    "fields": [],
+                    "total": 9790,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "311"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "PARTIAL DATASET ANSWER" in text
+            assert "311 - NEW SYSTEM" in text
+            assert "include_resource_totals=true" in text
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_no_partial_warning_when_resource_name(
+        self, ckan_config
+    ):
+        """When the model explicitly picks a resource via resource_name,
+        no PARTIAL warning — they got what they asked for."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "new",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2018",
+                                    "name": "311 - 2018",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {"records": [{"_id": 1}], "fields": [], "total": 5}
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {"query": "311", "resource_name": "2018"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "PARTIAL DATASET ANSWER" not in text
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_include_resource_totals_runs_parallel_counts(
+        self, ckan_config
+    ):
+        """include_resource_totals=true must run COUNT(*) against EVERY
+        queryable resource and surface a grand-total + per-resource
+        breakdown, so 'total across all years' resolves in one call."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "11111111-2222-3333-4444-555555555555",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "22222222-3333-4444-5555-666666666666",
+                                    "name": "311 - 2025",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "33333333-4444-5555-6666-777777777777",
+                                    "name": "311 - 2024",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            # Main query (NEW SYSTEM) returns sample rows
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(10)],
+                    "fields": [{"id": "_id", "type": "int"}],
+                    "total": 9790,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            # Three COUNT(*) calls — return totals for each archive
+            def make_count_response(n):
+                m = Mock()
+                m.json.return_value = {
+                    "result": {"records": [{"n": n}]}
+                }
+                m.raise_for_status = Mock()
+                return m
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                    make_count_response(9790),
+                    make_count_response(267187),
+                    make_count_response(282836),
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {"query": "311", "include_resource_totals": True},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Per-resource breakdown rendered
+            assert "Per-resource totals" in text
+            assert "9790" in text
+            assert "267187" in text
+            assert "282836" in text
+            # Grand total = sum of all three
+            assert "GRAND TOTAL across 3 resources: 559813" in text
+            # Three COUNT(*) calls beyond init + search + main query
+            assert mock_client.post.call_count == 6
+
+    @pytest.mark.asyncio
     async def test_execute_tool_search_and_query_walks_to_next_dataset(
         self, ckan_config
     ):
