@@ -212,6 +212,7 @@ lambda-deployment.zip
 terraform/*/.terraform/
 terraform/*/.terraform.lock.hcl
 terraform/*/lambda-deployment.zip
+terraform/*/tfplan
 
 # Terraform state (contains secrets, ignore across all folders)
 **/*.tfstate
@@ -232,3 +233,8 @@ client/opencontext-client-*
 # Config yaml
 config.yaml
 examples/
+
+# Local scratch / debug artifacts (not part of the project)
+.claude/
+live_*.json
+probe_*.json
