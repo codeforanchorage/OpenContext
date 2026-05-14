@@ -144,6 +144,16 @@ resource "aws_api_gateway_deployment" "mcp_deployment" {
   ]
 }
 
+# CloudWatch Log Group for API Gateway access logs
+resource "aws_cloudwatch_log_group" "apigw_access_logs" {
+  name              = "/aws/apigateway/${local.lambda_name}-access"
+  retention_in_days = 14
+
+  tags = {
+    Project = "mcp-server"
+  }
+}
+
 # API Gateway Stage
 resource "aws_api_gateway_stage" "prod" {
   deployment_id = aws_api_gateway_deployment.mcp_deployment.id
@@ -151,6 +161,20 @@ resource "aws_api_gateway_stage" "prod" {
   stage_name    = var.stage_name
 
   xray_tracing_enabled = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.apigw_access_logs.arn
+    format = jsonencode({
+      requestId      = "$context.requestId"
+      ip             = "$context.identity.sourceIp"
+      requestTime    = "$context.requestTime"
+      httpMethod     = "$context.httpMethod"
+      resourcePath   = "$context.resourcePath"
+      status         = "$context.status"
+      protocol       = "$context.protocol"
+      responseLength = "$context.responseLength"
+    })
+  }
 }
 
 # Method Settings: Throttling for all methods in stage (AWS format: */* not /*/*)

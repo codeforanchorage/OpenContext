@@ -17,6 +17,15 @@ from core.plugin_manager import PluginManager
 logger = logging.getLogger(__name__)
 
 
+class MethodNotFoundError(Exception):
+    """Raised when a JSON-RPC request names a method the server does not implement.
+
+    Mapped to JSON-RPC error code -32601 ("Method not found") rather than the
+    generic -32603 ("Internal error"), so well-behaved clients can tell an
+    unknown method apart from a genuine server-side failure.
+    """
+
+
 class MCPServer:
     """MCP Server that handles JSON-RPC requests and routes to Plugin Manager."""
 
@@ -86,7 +95,7 @@ class MCPServer:
                         },
                     )
                     return None
-                raise ValueError(f"Unknown method: {method}")
+                raise MethodNotFoundError(f"Unknown method: {method}")
 
             # Don't send response for notifications
             if is_notification:
@@ -122,14 +131,24 @@ class MCPServer:
 
         except Exception as e:
             duration_ms = (time.perf_counter() - start_time) * 1000
-            error_response = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
+            # Unknown methods are a client error (-32601 Method not found), not a
+            # server fault (-32603 Internal error). Everything else is -32603.
+            if isinstance(e, MethodNotFoundError):
+                error = {
+                    "code": -32601,
+                    "message": "Method not found",
+                    "data": str(e),
+                }
+            else:
+                error = {
                     "code": -32603,
                     "message": "Internal error",
                     "data": str(e),
-                },
+                }
+            error_response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": error,
             }
 
             # Log JSON-RPC error response

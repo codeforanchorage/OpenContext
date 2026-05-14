@@ -495,9 +495,7 @@ class TestExecuteTool:
             await plugin.initialize()
             result = await plugin.execute_tool(
                 "execute_sql",
-                {
-                    "sql": 'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'
-                },
+                {"sql": 'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'},
             )
 
             assert result.success is True
@@ -545,9 +543,7 @@ class TestExecuteTool:
             assert "required" in result.error_message.lower()
 
     @pytest.mark.asyncio
-    async def test_execute_tool_search_datasets_surfaces_total_count(
-        self, ckan_config
-    ):
+    async def test_execute_tool_search_datasets_surfaces_total_count(self, ckan_config):
         """search_datasets reads CKAN's `count` and renders X-of-Y."""
         plugin = CKANPlugin(ckan_config)
 
@@ -609,8 +605,7 @@ class TestExecuteTool:
                 "execute_sql",
                 {
                     "sql": (
-                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
-                        "LIMIT 100"
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 100'
                     )
                 },
             )
@@ -621,9 +616,7 @@ class TestExecuteTool:
             assert "ckan__aggregate_data" in text or "COUNT(*)" in text
 
     @pytest.mark.asyncio
-    async def test_execute_tool_execute_sql_no_warning_under_limit(
-        self, ckan_config
-    ):
+    async def test_execute_tool_execute_sql_no_warning_under_limit(self, ckan_config):
         """execute_sql does not warn when fewer rows returned than LIMIT."""
         plugin = CKANPlugin(ckan_config)
 
@@ -650,8 +643,7 @@ class TestExecuteTool:
                 "execute_sql",
                 {
                     "sql": (
-                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
-                        "LIMIT 100"
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 100'
                     )
                 },
             )
@@ -851,9 +843,7 @@ class TestExecuteTool:
             mock_client_class.return_value = mock_client
 
             await plugin.initialize()
-            result = await plugin.execute_tool(
-                "search_and_query", {"query": "parks"}
-            )
+            result = await plugin.execute_tool("search_and_query", {"query": "parks"})
 
             assert result.success is True
             text = result.content[0]["text"]
@@ -1068,9 +1058,7 @@ class TestExecuteTool:
             mock_client_class.return_value = mock_client
 
             await plugin.initialize()
-            result = await plugin.execute_tool(
-                "search_and_query", {"query": "311"}
-            )
+            result = await plugin.execute_tool("search_and_query", {"query": "311"})
 
             assert result.success is True
             text = result.content[0]["text"]
@@ -1079,9 +1067,242 @@ class TestExecuteTool:
             assert "311 - 2024" in text
             # Only QUERYABLE siblings — the GeoJSON should not appear
             # in the siblings block
-            assert "GeoJSON" not in text.split(
-                "Other queryable resources in this dataset"
-            )[1]
+            assert (
+                "GeoJSON"
+                not in text.split("Other queryable resources in this dataset")[1]
+            )
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_emits_partial_warning_when_auto_picked(
+        self, ckan_config
+    ):
+        """When the model auto-picks a resource and queryable siblings
+        exist, the response must include a PARTIAL DATASET ANSWER block
+        — otherwise GPT-4o reads the one-resource count as the dataset
+        total. Regression test for: 'How many 311 requests in total?'
+        returning 9,790 (NEW SYSTEM) instead of walking 22 archives."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311 Service Requests",
+                            "resources": [
+                                {
+                                    "id": "new-uuid",
+                                    "name": "311 - NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2025",
+                                    "name": "311 - 2025",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2024",
+                                    "name": "311 - 2024",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1}],
+                    "fields": [],
+                    "total": 9790,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool("search_and_query", {"query": "311"})
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "PARTIAL DATASET ANSWER" in text
+            assert "311 - NEW SYSTEM" in text
+            assert "include_resource_totals=true" in text
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_no_partial_warning_when_resource_name(
+        self, ckan_config
+    ):
+        """When the model explicitly picks a resource via resource_name,
+        no PARTIAL warning — they got what they asked for."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "new",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "y2018",
+                                    "name": "311 - 2018",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {"records": [{"_id": 1}], "fields": [], "total": 5}
+            }
+            mock_response_query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {"query": "311", "resource_name": "2018"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "PARTIAL DATASET ANSWER" not in text
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_include_resource_totals_runs_parallel_counts(
+        self, ckan_config
+    ):
+        """include_resource_totals=true must run COUNT(*) against EVERY
+        queryable resource and surface a grand-total + per-resource
+        breakdown, so 'total across all years' resolves in one call."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_response_init = Mock()
+            mock_response_init.json.return_value = {"success": True}
+            mock_response_init.raise_for_status = Mock()
+            mock_response_search = Mock()
+            mock_response_search.json.return_value = {
+                "result": {
+                    "results": [
+                        {
+                            "id": "ds-311",
+                            "title": "311",
+                            "resources": [
+                                {
+                                    "id": "11111111-2222-3333-4444-555555555555",
+                                    "name": "NEW SYSTEM",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "22222222-3333-4444-5555-666666666666",
+                                    "name": "311 - 2025",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                                {
+                                    "id": "33333333-4444-5555-6666-777777777777",
+                                    "name": "311 - 2024",
+                                    "format": "CSV",
+                                    "datastore_active": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+            mock_response_search.raise_for_status = Mock()
+            # Main query (NEW SYSTEM) returns sample rows
+            mock_response_query = Mock()
+            mock_response_query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(10)],
+                    "fields": [{"id": "_id", "type": "int"}],
+                    "total": 9790,
+                }
+            }
+            mock_response_query.raise_for_status = Mock()
+
+            # Three COUNT(*) calls — return totals for each archive
+            def make_count_response(n):
+                m = Mock()
+                m.json.return_value = {"result": {"records": [{"n": n}]}}
+                m.raise_for_status = Mock()
+                return m
+
+            mock_client.post = AsyncMock(
+                side_effect=[
+                    mock_response_init,
+                    mock_response_search,
+                    mock_response_query,
+                    make_count_response(9790),
+                    make_count_response(267187),
+                    make_count_response(282836),
+                ]
+            )
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query",
+                {"query": "311", "include_resource_totals": True},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Per-resource breakdown rendered
+            assert "Per-resource totals" in text
+            assert "9790" in text
+            assert "267187" in text
+            assert "282836" in text
+            # Grand total = sum of all three
+            assert "GRAND TOTAL across 3 resources: 559813" in text
+            # Three COUNT(*) calls beyond init + search + main query
+            assert mock_client.post.call_count == 6
 
     @pytest.mark.asyncio
     async def test_execute_tool_search_and_query_walks_to_next_dataset(
@@ -1164,6 +1385,20 @@ class TestExecuteTool:
             mock_response_init = Mock()
             mock_response_init.json.return_value = {"success": True}
             mock_response_init.raise_for_status = Mock()
+            # Pre-flight field-name validation fetches the schema before the
+            # SQL call; mock that response with the same fields the SQL call
+            # would expose.
+            mock_response_schema = Mock()
+            mock_response_schema.json.return_value = {
+                "result": {
+                    "fields": [
+                        {"id": "case_id", "type": "text"},
+                        {"id": "close_date", "type": "timestamp"},
+                        {"id": "case_status", "type": "text"},
+                    ],
+                }
+            }
+            mock_response_schema.raise_for_status = Mock()
             mock_response_sql = Mock()
             mock_response_sql.json.return_value = {
                 "result": {
@@ -1179,7 +1414,11 @@ class TestExecuteTool:
             }
             mock_response_sql.raise_for_status = Mock()
             mock_client.post = AsyncMock(
-                side_effect=[mock_response_init, mock_response_sql]
+                side_effect=[
+                    mock_response_init,
+                    mock_response_schema,
+                    mock_response_sql,
+                ]
             )
             mock_client_class.return_value = mock_client
 
@@ -1205,24 +1444,27 @@ class TestExecuteTool:
             # Schema footer surfaces filterable columns
             assert "Filterable columns" in text
             assert "close_date" in text
-            # Verify the second POST hit datastore_search_sql with a SQL
-            # body containing the expected WHERE clause.
-            second_call = mock_client.post.call_args_list[1]
-            assert second_call[0][0] == "/api/3/action/datastore_search_sql"
-            sql = second_call[1]["json"]["sql"]
-            assert (
-                'FROM "11111111-2222-3333-4444-555555555555"' in sql
-            )
-            assert '"close_date" >= \'2026-04-29\'' in sql
-            assert '"close_date" < \'2026-04-30\'' in sql
-            assert '"case_status" = \'Closed\'' in sql
+            # Verify the SQL POST (3rd call: init, schema preflight, SQL)
+            # hit datastore_search_sql with the expected WHERE clause.
+            sql_call = mock_client.post.call_args_list[2]
+            assert sql_call[0][0] == "/api/3/action/datastore_search_sql"
+            sql = sql_call[1]["json"]["sql"]
+            assert 'FROM "11111111-2222-3333-4444-555555555555"' in sql
+            assert "\"close_date\" >= '2026-04-29'" in sql
+            assert "\"close_date\" < '2026-04-30'" in sql
+            assert "\"case_status\" = 'Closed'" in sql
             assert "LIMIT 5" in sql
 
     @pytest.mark.asyncio
     async def test_execute_tool_query_data_where_validation_error_surfaces(
         self, ckan_config
     ):
-        """A bad `where` operator returns a clean error — no API call."""
+        """A bad `where` operator returns a clean error — no SQL call.
+
+        Pre-flight field-name validation may also hit /datastore_search to
+        fetch the schema, so we only require that the SQL endpoint
+        (/datastore_search_sql) is never reached.
+        """
         plugin = CKANPlugin(ckan_config)
 
         with patch("httpx.AsyncClient") as mock_client_class:
@@ -1244,8 +1486,10 @@ class TestExecuteTool:
 
             assert result.success is False
             assert "Unknown operator" in (result.error_message or "")
-            # Only the init POST should have happened — no SQL call.
-            assert mock_client.post.call_count == 1
+            # SQL endpoint must NOT have been called — the error fires
+            # before SQL is built.
+            for call in mock_client.post.call_args_list:
+                assert call[0][0] != "/api/3/action/datastore_search_sql"
 
     @pytest.mark.asyncio
     async def test_execute_tool_query_data_schema_footer_in_normal_path(
@@ -1288,9 +1532,7 @@ class TestExecuteTool:
             assert "z (int)" in text
 
     @pytest.mark.asyncio
-    async def test_query_data_surfaces_total_from_datastore_search(
-        self, ckan_config
-    ):
+    async def test_query_data_surfaces_total_from_datastore_search(self, ckan_config):
         """When CKAN returns `total`, format prefers total_matching_rows
         over returned_rows."""
         plugin = CKANPlugin(ckan_config)
@@ -1331,9 +1573,7 @@ class TestExecuteTool:
             assert "ckan__aggregate_data" in text
 
     @pytest.mark.asyncio
-    async def test_query_data_no_truncation_warning_when_under_limit(
-        self, ckan_config
-    ):
+    async def test_query_data_no_truncation_warning_when_under_limit(self, ckan_config):
         """When records returned < limit, no truncation warning shown."""
         plugin = CKANPlugin(ckan_config)
 
@@ -1384,13 +1624,22 @@ class TestExecuteTool:
             mock_response_init = Mock()
             mock_response_init.json.return_value = {"success": True}
             mock_response_init.raise_for_status = Mock()
+            # Pre-flight schema fetch (civic-AI field-name validation)
+            mock_response_schema = Mock()
+            mock_response_schema.json.return_value = {
+                "result": {
+                    "fields": [
+                        {"id": "case_id", "type": "text"},
+                        {"id": "closed_dt", "type": "timestamp"},
+                    ],
+                }
+            }
+            mock_response_schema.raise_for_status = Mock()
             # First SQL call: SELECT * returns exactly limit rows
             mock_response_select = Mock()
             mock_response_select.json.return_value = {
                 "result": {
-                    "records": [
-                        {"_id": i, "case_id": f"c{i}"} for i in range(100)
-                    ],
+                    "records": [{"_id": i, "case_id": f"c{i}"} for i in range(100)],
                     "fields": [
                         {"id": "case_id", "type": "text"},
                         {"id": "closed_dt", "type": "timestamp"},
@@ -1407,6 +1656,7 @@ class TestExecuteTool:
             mock_client.post = AsyncMock(
                 side_effect=[
                     mock_response_init,
+                    mock_response_schema,
                     mock_response_select,
                     mock_response_count,
                 ]
@@ -1433,17 +1683,16 @@ class TestExecuteTool:
             assert "100 of 531" in text
             assert "TRUNCATED" in text
             assert "the answer is 531, NOT 100" in text
-            # Follow-up COUNT(*) actually issued
-            assert mock_client.post.call_count == 3
-            count_call = mock_client.post.call_args_list[2]
+            # Follow-up COUNT(*) is the last call; init + schema + SQL +
+            # count = 4 total.
+            assert mock_client.post.call_count == 4
+            count_call = mock_client.post.call_args_list[3]
             count_sql = count_call[1]["json"]["sql"]
             assert "COUNT(*)" in count_sql
-            assert '"closed_dt" >= \'2016-04-29\'' in count_sql
+            assert "\"closed_dt\" >= '2016-04-29'" in count_sql
 
     @pytest.mark.asyncio
-    async def test_query_data_where_path_no_count_when_under_limit(
-        self, ckan_config
-    ):
+    async def test_query_data_where_path_no_count_when_under_limit(self, ckan_config):
         """SQL path: if records returned < limit we already know the total
         — no extra COUNT(*) call should fire."""
         plugin = CKANPlugin(ckan_config)
@@ -1453,6 +1702,12 @@ class TestExecuteTool:
             mock_response_init = Mock()
             mock_response_init.json.return_value = {"success": True}
             mock_response_init.raise_for_status = Mock()
+            # Pre-flight schema (empty fields is fine — validator returns None)
+            mock_response_schema = Mock()
+            mock_response_schema.json.return_value = {
+                "result": {"fields": [{"id": "x", "type": "int"}]}
+            }
+            mock_response_schema.raise_for_status = Mock()
             mock_response_select = Mock()
             mock_response_select.json.return_value = {
                 "result": {
@@ -1462,7 +1717,11 @@ class TestExecuteTool:
             }
             mock_response_select.raise_for_status = Mock()
             mock_client.post = AsyncMock(
-                side_effect=[mock_response_init, mock_response_select]
+                side_effect=[
+                    mock_response_init,
+                    mock_response_schema,
+                    mock_response_select,
+                ]
             )
             mock_client_class.return_value = mock_client
 
@@ -1480,8 +1739,15 @@ class TestExecuteTool:
             text = result.content[0]["text"]
             assert "85 rows returned" in text
             assert "TRUNCATED" not in text
-            # init + SELECT only, no COUNT(*)
-            assert mock_client.post.call_count == 2
+            # init + schema + SELECT only, no COUNT(*)
+            assert mock_client.post.call_count == 3
+            # And the SQL endpoint was called exactly once (just the SELECT).
+            sql_calls = [
+                c
+                for c in mock_client.post.call_args_list
+                if c[0][0] == "/api/3/action/datastore_search_sql"
+            ]
+            assert len(sql_calls) == 1
 
     @pytest.mark.asyncio
     async def test_query_data_where_path_count_failure_falls_back_to_warning(
@@ -1496,6 +1762,11 @@ class TestExecuteTool:
             mock_response_init = Mock()
             mock_response_init.json.return_value = {"success": True}
             mock_response_init.raise_for_status = Mock()
+            mock_response_schema = Mock()
+            mock_response_schema.json.return_value = {
+                "result": {"fields": [{"id": "x", "type": "int"}]}
+            }
+            mock_response_schema.raise_for_status = Mock()
             mock_response_select = Mock()
             mock_response_select.json.return_value = {
                 "result": {
@@ -1514,6 +1785,7 @@ class TestExecuteTool:
             mock_client.post = AsyncMock(
                 side_effect=[
                     mock_response_init,
+                    mock_response_schema,
                     mock_response_select,
                     mock_response_count_fail,
                 ]
@@ -1629,8 +1901,7 @@ class TestExecuteTool:
                 "success": False,
                 "error": {
                     "message": (
-                        'relation "11111111-2222-3333-4444-555555555555" '
-                        "does not exist"
+                        'relation "11111111-2222-3333-4444-555555555555" does not exist'
                     )
                 },
             }
@@ -1645,8 +1916,7 @@ class TestExecuteTool:
                 "execute_sql",
                 {
                     "sql": (
-                        'SELECT * FROM '
-                        '"11111111-2222-3333-4444-555555555555" LIMIT 1'
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'
                     )
                 },
             )
@@ -1670,6 +1940,11 @@ class TestExecuteTool:
             mock_response_init = Mock()
             mock_response_init.json.return_value = {"success": True}
             mock_response_init.raise_for_status = Mock()
+            # Pre-flight schema fetch (civic-AI field-name validation in
+            # aggregate_data validates group_by/metrics/filters names).
+            mock_response_schema = Mock()
+            mock_response_schema.json.return_value = {"result": {"fields": []}}
+            mock_response_schema.raise_for_status = Mock()
             mock_response_sql = Mock()
             mock_response_sql.json.return_value = {
                 "success": False,
@@ -1677,7 +1952,11 @@ class TestExecuteTool:
             }
             mock_response_sql.raise_for_status = Mock()
             mock_client.post = AsyncMock(
-                side_effect=[mock_response_init, mock_response_sql]
+                side_effect=[
+                    mock_response_init,
+                    mock_response_schema,
+                    mock_response_sql,
+                ]
             )
             mock_client_class.return_value = mock_client
 
@@ -1860,3 +2139,1613 @@ class TestRetryLogic:
             except Exception:
                 # If retry fails, exception is raised
                 pass
+
+
+class TestAbandonmentDetector:
+    """Civic-AI #5/#6: APPARENT ABANDONMENT + NO UPDATE CADENCE DECLARED."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    def _build_mocks(self, dataset_dict):
+        init = Mock()
+        init.json.return_value = {"success": True}
+        init.raise_for_status = Mock()
+        pkg = Mock()
+        pkg.json.return_value = {"result": dataset_dict}
+        pkg.raise_for_status = Mock()
+        return init, pkg
+
+    @pytest.mark.asyncio
+    async def test_abandonment_fires_when_weekly_dataset_months_stale(
+        self, ckan_config
+    ):
+        """Dataset declares weekly updates but resource last_modified is
+        over a year old -- well past 4x the 7-day cadence."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init, pkg = self._build_mocks(
+                {
+                    "id": "stale-weekly",
+                    "name": "stale-weekly",
+                    "title": "Stale Weekly Dataset",
+                    "metadata_modified": "2026-05-01T00:00:00",
+                    "frequency": "weekly",
+                    "organization": {"title": "Test"},
+                    "resources": [
+                        {
+                            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                            "name": "data",
+                            "datastore_active": True,
+                            "last_modified": "2023-01-01T00:00:00",
+                        }
+                    ],
+                }
+            )
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "get_dataset", {"dataset_id": "stale-weekly"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "APPARENT ABANDONMENT" in text
+            assert "'weekly'" in text
+            # Dual timestamps must both appear
+            assert "Data last updated: 2023-01-01" in text
+            assert "Metadata last touched: 2026-05-01" in text
+
+    @pytest.mark.asyncio
+    async def test_abandonment_silent_when_within_cadence(self, ckan_config):
+        """Weekly dataset modified within the last week -- abandonment
+        must stay silent. False alarms erode trust faster than silences."""
+        plugin = CKANPlugin(ckan_config)
+        from datetime import datetime, timezone, timedelta
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=3)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init, pkg = self._build_mocks(
+                {
+                    "id": "live-weekly",
+                    "name": "live-weekly",
+                    "title": "Live Weekly Dataset",
+                    "metadata_modified": recent,
+                    "frequency": "weekly",
+                    "organization": {"title": "Test"},
+                    "resources": [
+                        {
+                            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                            "name": "data",
+                            "datastore_active": True,
+                            "last_modified": recent,
+                        }
+                    ],
+                }
+            )
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "get_dataset", {"dataset_id": "live-weekly"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "APPARENT ABANDONMENT" not in text
+            assert "DATA FRESHNESS" not in text  # recent enough
+
+    @pytest.mark.asyncio
+    async def test_no_frequency_note_fires_on_old_undeclared_dataset(self, ckan_config):
+        """No frequency declared + resource > 2yr old -> the softer
+        'cannot tell if current' note."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init, pkg = self._build_mocks(
+                {
+                    "id": "no-freq",
+                    "name": "no-freq",
+                    "title": "Undeclared Dataset",
+                    # frequency intentionally omitted
+                    "organization": {"title": "Test"},
+                    "resources": [
+                        {
+                            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                            "name": "data",
+                            "datastore_active": True,
+                            "last_modified": "2020-01-01T00:00:00",
+                        }
+                    ],
+                }
+            )
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool("get_dataset", {"dataset_id": "no-freq"})
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "NO UPDATE CADENCE DECLARED" in text
+            # And the abandonment banner must NOT fire (no cadence to
+            # measure against)
+            assert "APPARENT ABANDONMENT" not in text
+
+
+class TestStringlyTypedDetection:
+    """Civic-AI #9: TEXT columns holding dates/numbers."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_text_column_with_iso_dates_fires_type_note(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "open_dt": "2024-06-15"},
+                        {"_id": 2, "open_dt": "2024-06-16"},
+                        {"_id": 3, "open_dt": "2024-06-17"},
+                        {"_id": 4, "open_dt": "2024-06-18"},
+                    ],
+                    "fields": [{"id": "open_dt", "type": "text"}],
+                    "total": 4,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "STRINGLY-TYPED FIELDS" in text
+            assert "'open_dt' is stored as TEXT but values look like dates" in text
+
+    @pytest.mark.asyncio
+    async def test_text_column_with_real_text_stays_silent(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "name": "Alice"},
+                        {"_id": 2, "name": "Bob"},
+                        {"_id": 3, "name": "Carol"},
+                        {"_id": 4, "name": "Dan"},
+                    ],
+                    "fields": [{"id": "name", "type": "text"}],
+                    "total": 4,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "STRINGLY-TYPED FIELDS" not in text
+
+    @pytest.mark.asyncio
+    async def test_text_column_with_numbers_fires_type_note(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "amount": "10"},
+                        {"_id": 2, "amount": "42"},
+                        {"_id": 3, "amount": "100"},
+                        {"_id": 4, "amount": "3"},
+                    ],
+                    "fields": [{"id": "amount", "type": "text"}],
+                    "total": 4,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "STRINGLY-TYPED FIELDS" in text
+            assert "look like numbers" in text
+
+
+class TestNullLikeNormalization:
+    """Civic-AI #10/#11: null-like rendering + DATA QUALITY frequency."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_null_like_strings_rendered_distinctly(self, ckan_config):
+        """'Unknown' / 'N/A' / '' / None all render distinctly so the
+        model can't treat them as ordinary categories."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "status": "Unknown"},
+                        {"_id": 2, "status": "N/A"},
+                        {"_id": 3, "status": ""},
+                        {"_id": 4, "status": None},
+                        {"_id": 5, "status": "Open"},
+                    ],
+                    "fields": [{"id": "status", "type": "text"}],
+                    "total": 5,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert 'status: <"Unknown">' in text
+            assert 'status: <"N/A">' in text
+            assert "status: <empty>" in text
+            assert "status: <null>" in text
+            assert "status: Open" in text  # real value rendered as-is
+
+    @pytest.mark.asyncio
+    async def test_high_missing_rate_fires_data_quality_caveat(self, ckan_config):
+        """When > 20% of a column's values are null-like, DATA QUALITY
+        caveat fires naming the column and the missing-rate."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": 1, "assigned_to": "Unknown"},
+                        {"_id": 2, "assigned_to": "Unknown"},
+                        {"_id": 3, "assigned_to": "N/A"},
+                        {"_id": 4, "assigned_to": "Alice"},
+                        {"_id": 5, "assigned_to": "Bob"},
+                    ],
+                    "fields": [{"id": "assigned_to", "type": "text"}],
+                    "total": 5,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "DATA QUALITY" in text
+            assert "'assigned_to'" in text
+            assert "60%" in text  # 3 of 5
+
+    @pytest.mark.asyncio
+    async def test_low_missing_rate_silent(self, ckan_config):
+        """One missing value out of many should not fire DATA QUALITY."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [
+                        {"_id": i, "assigned_to": f"user_{i}"} for i in range(20)
+                    ]
+                    + [{"_id": 21, "assigned_to": "Unknown"}],
+                    "fields": [{"id": "assigned_to", "type": "text"}],
+                    "total": 21,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "DATA QUALITY" not in text
+
+
+class TestSqlPassthroughCaveat:
+    """Civic-AI #13: SQL PASSTHROUGH warning on execute_sql only."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_sql_carries_passthrough_warning(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            sql_resp = Mock()
+            sql_resp.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "n": 42}],
+                    "fields": [{"id": "n", "type": "int4"}],
+                }
+            }
+            sql_resp.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, sql_resp])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "execute_sql",
+                {
+                    "sql": (
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'
+                    )
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "SQL PASSTHROUGH" in text
+            assert "the model wrote it" in text
+
+    @pytest.mark.asyncio
+    async def test_aggregate_data_does_not_carry_passthrough_warning(self, ckan_config):
+        """aggregate_data builds SQL from validated parts -- not a
+        passthrough, so the warning must stay silent."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            schema = Mock()
+            schema.json.return_value = {
+                "result": {"fields": [{"id": "neighborhood", "type": "text"}]}
+            }
+            schema.raise_for_status = Mock()
+            agg_resp = Mock()
+            agg_resp.json.return_value = {
+                "result": {
+                    "records": [{"neighborhood": "Allston", "n": 100}],
+                    "fields": [
+                        {"id": "neighborhood", "type": "text"},
+                        {"id": "n", "type": "int4"},
+                    ],
+                }
+            }
+            agg_resp.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema, agg_resp])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "aggregate_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "group_by": ["neighborhood"],
+                    "metrics": {"n": "count(*)"},
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "SQL PASSTHROUGH" not in text
+
+
+class TestSearchAmbiguityCaveat:
+    """Civic-AI #14: warn when multiple plausible matches surface."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_ambiguity_fires_with_overlapping_titles(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            search = Mock()
+            search.json.return_value = {
+                "result": {
+                    "count": 3,
+                    "results": [
+                        {
+                            "id": "1",
+                            "title": "Crime Incident Reports",
+                            "resources": [],
+                        },
+                        {
+                            "id": "2",
+                            "title": "Crime Stats Summary",
+                            "resources": [],
+                        },
+                        {
+                            "id": "3",
+                            "title": "Crime Mapping Data",
+                            "resources": [],
+                        },
+                    ],
+                }
+            }
+            search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, search])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_datasets", {"query": "crime", "limit": 5}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "AMBIGUOUS SEARCH" in text
+            assert "Crime Stats Summary" in text
+
+    @pytest.mark.asyncio
+    async def test_ambiguity_silent_with_unrelated_topics(self, ckan_config):
+        """When the top result and others share no title tokens, no
+        ambiguity warning."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            search = Mock()
+            search.json.return_value = {
+                "result": {
+                    "count": 2,
+                    "results": [
+                        {
+                            "id": "1",
+                            "title": "Building Permits",
+                            "resources": [],
+                        },
+                        {
+                            "id": "2",
+                            "title": "Tree Census",
+                            "resources": [],
+                        },
+                    ],
+                }
+            }
+            search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, search])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_datasets", {"query": "city data", "limit": 5}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "AMBIGUOUS SEARCH" not in text
+
+
+class TestAsciiOnlyOutput:
+    """Copilot C1: every formatter output must be ASCII-only."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_search_and_query_output_is_pure_ascii(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            search = Mock()
+            search.json.return_value = {
+                "result": {
+                    "count": 1,
+                    "results": [
+                        {
+                            "id": "x",
+                            "name": "x",
+                            "title": "X",
+                            "metadata_modified": "2026-05-01T00:00:00",
+                            "resources": [
+                                {
+                                    "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                                    "name": "y",
+                                    "datastore_active": True,
+                                    "last_modified": "2023-01-01T00:00:00",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+            search.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "v": "ok"}],
+                    "fields": [{"id": "v", "type": "text"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, search, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_and_query", {"query": "x", "limit": 5}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Every character must be ASCII -- Copilot has dropped
+            # non-ASCII glyphs into '?' / boxes in production.
+            assert text.isascii(), "non-ASCII characters in output: " + repr(
+                [c for c in text if not c.isascii()][:10]
+            )
+
+
+class TestZeroRecordsAbsenceOfEvidence:
+    """Copilot C11: empty responses must spell out that absence is not
+    evidence of absence."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_query_response_includes_no_evidence_note(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [],
+                    "fields": [{"id": "name", "type": "text"}],
+                    "total": 0,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "zero records does NOT mean zero data" in text
+
+
+class TestProseRemindersForCriticalCaveats:
+    """Copilot A3: critical caveats must also appear as bottom-of-response
+    prose reminders so GPT-4o doesn't drop the structured marker."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_record_emits_prose_reminder(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "v": "only-one"}],
+                    "fields": [{"id": "v", "type": "text"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            text = result.content[0]["text"]
+            assert "SINGLE-RECORD CLAIM" in text
+            # Prose reminder must also appear (Copilot A3)
+            assert "(Reminder: only ONE record matched" in text
+            # And the prose reminder appears AFTER the structured banner
+            assert text.index("SINGLE-RECORD CLAIM") < text.index(
+                "(Reminder: only ONE record"
+            )
+
+    @pytest.mark.asyncio
+    async def test_abandonment_emits_prose_reminder(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            pkg = Mock()
+            pkg.json.return_value = {
+                "result": {
+                    "id": "stale",
+                    "name": "stale",
+                    "title": "Stale",
+                    "metadata_modified": "2026-05-01T00:00:00",
+                    "frequency": "weekly",
+                    "organization": {"title": "T"},
+                    "resources": [
+                        {
+                            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                            "datastore_active": True,
+                            "last_modified": "2023-01-01T00:00:00",
+                        }
+                    ],
+                }
+            }
+            pkg.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool("get_dataset", {"dataset_id": "stale"})
+
+            text = result.content[0]["text"]
+            assert "APPARENT ABANDONMENT" in text
+            assert "(Reminder: this dataset shows APPARENT ABANDONMENT" in text
+
+    @pytest.mark.asyncio
+    async def test_sql_passthrough_emits_prose_reminder(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            sql_resp = Mock()
+            sql_resp.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "n": 5}],
+                    "fields": [{"id": "n", "type": "int4"}],
+                }
+            }
+            sql_resp.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, sql_resp])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "execute_sql",
+                {
+                    "sql": (
+                        'SELECT * FROM "11111111-2222-3333-4444-555555555555" LIMIT 1'
+                    )
+                },
+            )
+
+            text = result.content[0]["text"]
+            assert "SQL PASSTHROUGH" in text
+            assert "(Reminder: the SQL above was written by the model" in text
+
+    @pytest.mark.asyncio
+    async def test_no_prose_reminders_when_no_critical_caveats(self, ckan_config):
+        """Stays silent when nothing critical fired."""
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i, "v": f"r{i}"} for i in range(50)],
+                    "fields": [{"id": "v", "type": "text"}],
+                    "total": 50,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            text = result.content[0]["text"]
+            assert "(Reminder:" not in text
+
+
+class TestErrorMessageShape:
+    """Copilot C3/C4 + D4: error messages stay ASCII, don't carry
+    magic-string templates, and push the model back toward discovery."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    def test_no_fake_uuid_example_in_any_tool_description(self, ckan_config):
+        """The fake UUID pattern was once present in query_data's
+        resource_id description; GPT-4o can parrot it back as an
+        invented ID. Make sure it's gone from every description."""
+        plugin = CKANPlugin(ckan_config)
+        for tool in plugin.get_tools():
+            blob = repr(tool.input_schema) + tool.description
+            assert "11111111-2222-3333-4444-555555555555" not in blob, (
+                f"Tool {tool.name!r} still contains the worked-example "
+                "UUID; GPT-4o may parrot this back as a real ID."
+            )
+
+    def test_typo_error_routes_to_discovery_not_template(self, ckan_config):
+        """The 'did you mean' error must suggest a REAL field from the
+        actual schema (not a synthetic template) and point at
+        discovery tools."""
+        import asyncio
+
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            schema = Mock()
+            schema.json.return_value = {
+                "result": {
+                    "fields": [
+                        {"id": "case_status", "type": "text"},
+                        {"id": "case_id", "type": "text"},
+                    ]
+                }
+            }
+            schema.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema])
+            mock_client_class.return_value = mock_client
+
+            async def run():
+                await plugin.initialize()
+                return await plugin.execute_tool(
+                    "query_data",
+                    {
+                        "resource_id": "11111111-2222-3333-4444-555555555555",
+                        "filters": {"case_staus": "Closed"},
+                    },
+                )
+
+            result = asyncio.run(run())
+            assert result.success is False
+            msg = result.error_message or ""
+            # Must contain the real schema column, not a synthetic template
+            assert "case_status" in msg
+            assert "did you mean" in msg
+            # And the suggestion is a REAL column (matches the mocked schema)
+            assert "Valid columns: case_id, case_status" in msg or (
+                "Valid columns: case_status, case_id" in msg
+            )
+
+    def test_error_messages_are_ascii(self, ckan_config):
+        """D4: error paths must stay ASCII too -- a non-ASCII error in
+        Copilot can render as '?'/boxes and obscure actionable text."""
+        import asyncio
+
+        plugin = CKANPlugin(ckan_config)
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            mock_client.post = AsyncMock(return_value=init)
+            mock_client_class.return_value = mock_client
+
+            async def run():
+                await plugin.initialize()
+                return await plugin.execute_tool(
+                    "query_data",
+                    {
+                        "resource_id": "11111111-2222-3333-4444-555555555555",
+                        "where": {"col": {"regex": "."}},
+                    },
+                )
+
+            result = asyncio.run(run())
+            assert result.success is False
+            msg = result.error_message or ""
+            assert msg.isascii(), "Error message contains non-ASCII: " + repr(
+                [c for c in msg if not c.isascii()][:10]
+            )
+
+
+class TestToolDescriptionBudget:
+    """Copilot B1: every tool description fits in ~150 tokens / 600 chars
+    so GPT-4o actually attends to it."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    def test_all_descriptions_under_budget(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        for tool in plugin.get_tools():
+            assert len(tool.description) <= 600, (
+                f"{tool.name!r} description is "
+                f"{len(tool.description)} chars; trim to <=600."
+            )
+
+
+class TestLoweredDefaultLimits:
+    """Copilot C8: smaller default limits (20 / 10) than CKAN's 100."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    def test_tool_defaults_are_copilot_friendly(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+        tools = {t.name: t for t in plugin.get_tools()}
+        # search_datasets default limit
+        assert (
+            tools["search_datasets"].input_schema["properties"]["limit"]["default"]
+            <= 20
+        )
+        # query_data default limit
+        assert tools["query_data"].input_schema["properties"]["limit"]["default"] <= 25
+        # search_and_query default limit
+        assert (
+            tools["search_and_query"].input_schema["properties"]["limit"]["default"]
+            <= 25
+        )
+
+
+# ---------------------------------------------------------------------------
+# Civic-AI tool-design caveats
+#
+# These tests follow the civicaitools.org pattern: every devil's-advocate
+# check needs a "fires when expected" test AND a "silent when not
+# applicable" test. False alarms erode trust faster than false silences.
+# ---------------------------------------------------------------------------
+
+
+class TestProvenanceHeaderAndRetrievedFooter:
+    """Civic-AI #1, #2, #3: Source line + echoed Query + Retrieved
+    timestamp must appear on every successful tool response."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_search_datasets_response_has_source_query_and_retrieved(
+        self, ckan_config
+    ):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            search = Mock()
+            search.json.return_value = {"result": {"results": [], "count": 0}}
+            search.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, search])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "search_datasets", {"query": "311", "limit": 5}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Section header survives Copilot markdown stripping (C4)
+            assert "## Source" in text
+            # Human-readable Source line names the portal + query
+            assert "Source: https://data.example.com search for '311'" in text
+            # API line points at the exact CKAN action endpoint
+            assert (
+                "API: POST https://data.example.com/api/3/action/package_search" in text
+            )
+            # Echoed query repeats the params we sent
+            assert "Query [package_search]: q='311', rows=5" in text
+            # Retrieved footer is ISO-8601 with Z suffix
+            assert "_Retrieved: " in text
+            assert text.rstrip().endswith("Z_")
+
+    @pytest.mark.asyncio
+    async def test_query_data_provenance_shows_sql_action_when_where_used(
+        self, ckan_config
+    ):
+        """When `where` routes through datastore_search_sql, the Source
+        line must reflect that — not the equality-only endpoint."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            schema = Mock()
+            schema.json.return_value = {
+                "result": {"fields": [{"id": "x", "type": "int"}]}
+            }
+            schema.raise_for_status = Mock()
+            sql = Mock()
+            sql.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "x": 42}],
+                    "fields": [{"id": "x", "type": "int"}],
+                }
+            }
+            sql.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema, sql])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "where": {"x": {"gt": 1}},
+                    "limit": 5,
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # API line names the action that actually fired
+            api_line = next(
+                line for line in text.splitlines() if line.startswith("API:")
+            )
+            assert "datastore_search_sql" in api_line
+            # Equality-only action must NOT show up in the API line
+            assert "/api/3/action/datastore_search;" not in api_line
+            assert not api_line.endswith("/api/3/action/datastore_search")
+
+    @pytest.mark.asyncio
+    async def test_long_sql_in_echoed_query_is_truncated(self, ckan_config):
+        """The Query line must not blow up when SQL is long."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            sql_resp = Mock()
+            sql_resp.json.return_value = {"result": {"records": [], "fields": []}}
+            sql_resp.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, sql_resp])
+            mock_client_class.return_value = mock_client
+
+            long_sql = (
+                'SELECT * FROM "11111111-2222-3333-4444-555555555555" '
+                "WHERE " + " AND ".join(f'"c{i}" = {i}' for i in range(80)) + " LIMIT 1"
+            )
+            await plugin.initialize()
+            result = await plugin.execute_tool("execute_sql", {"sql": long_sql})
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            # Should still have a Query line, and the value should have
+            # been truncated with an ellipsis (not the full 3000+ char SQL)
+            query_line = next(
+                line for line in text.splitlines() if line.startswith("Query [")
+            )
+            assert "..." in query_line
+            assert len(query_line) < 400
+
+
+class TestSampleSizeCaveats:
+    """Civic-AI #5, #6: SINGLE-RECORD and SMALL SAMPLE banners must fire
+    on tiny result sets and stay silent on large ones."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_record_caveat_fires_when_total_is_one(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "name": "only one"}],
+                    "fields": [{"id": "name", "type": "text"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "SINGLE-RECORD CLAIM" in text
+            assert "N=1" in text
+            assert "SMALL SAMPLE" not in text  # mutually exclusive
+
+    @pytest.mark.asyncio
+    async def test_small_sample_caveat_fires_for_total_between_2_and_10(
+        self, ckan_config
+    ):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(5)],
+                    "fields": [],
+                    "total": 5,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "SMALL SAMPLE" in text
+            assert "Only 5 row" in text
+            assert "SINGLE-RECORD" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_sample_caveat_when_total_is_large(self, ckan_config):
+        """Stays silent for totals above the small-sample threshold."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": i} for i in range(50)],
+                    "fields": [],
+                    "total": 50,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "SMALL SAMPLE" not in text
+            assert "SINGLE-RECORD" not in text
+
+
+class TestDataFreshnessCaveat:
+    """Civic-AI #10: stale dataset warning."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_freshness_caveat_fires_on_old_dataset(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            pkg = Mock()
+            pkg.json.return_value = {
+                "result": {
+                    "id": "old-dataset",
+                    "name": "old-dataset",
+                    "title": "Old Dataset",
+                    "metadata_modified": "2018-01-15T12:00:00",
+                    "organization": {"title": "Test"},
+                    "resources": [],
+                }
+            }
+            pkg.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "get_dataset", {"dataset_id": "old-dataset"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "DATA FRESHNESS" in text
+            assert "2018-01-15" in text
+
+    @pytest.mark.asyncio
+    async def test_freshness_caveat_silent_on_recent_dataset(self, ckan_config):
+        """Datasets edited within the last year must not trigger the
+        freshness banner."""
+        from datetime import datetime, timezone
+
+        plugin = CKANPlugin(ckan_config)
+
+        recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            pkg = Mock()
+            pkg.json.return_value = {
+                "result": {
+                    "id": "fresh-dataset",
+                    "name": "fresh-dataset",
+                    "title": "Fresh Dataset",
+                    "metadata_modified": recent,
+                    "organization": {"title": "Test"},
+                    "resources": [],
+                }
+            }
+            pkg.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "get_dataset", {"dataset_id": "fresh-dataset"}
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "DATA FRESHNESS" not in text
+
+    @pytest.mark.asyncio
+    async def test_freshness_caveat_silent_on_missing_metadata_modified(
+        self, ckan_config
+    ):
+        """If the field isn't present, degrade silently — false silences
+        beat false alarms (civic-AI #15)."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            pkg = Mock()
+            pkg.json.return_value = {
+                "result": {
+                    "id": "x",
+                    "name": "x",
+                    "title": "X",
+                    "organization": {"title": "Test"},
+                    "resources": [],
+                }
+            }
+            pkg.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, pkg])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool("get_dataset", {"dataset_id": "x"})
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "DATA FRESHNESS" not in text
+
+
+class TestFieldNameValidation:
+    """Civic-AI #9: difflib-based 'did you mean?' on typos."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_typo_in_filters_returns_did_you_mean_hint(self, ckan_config):
+        """A misspelled column in `filters` is caught pre-flight with a
+        suggestion instead of leaking through to an upstream 409."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            schema = Mock()
+            schema.json.return_value = {
+                "result": {
+                    "fields": [
+                        {"id": "case_status", "type": "text"},
+                        {"id": "close_date", "type": "timestamp"},
+                    ]
+                }
+            }
+            schema.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "filters": {"case_staus": "Closed"},  # typo: missing 't'
+                },
+            )
+
+            assert result.success is False
+            assert "Unknown field" in (result.error_message or "")
+            assert "case_staus" in result.error_message
+            assert "did you mean 'case_status'" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_valid_field_names_pass_through_silently(self, ckan_config):
+        """When every field name is valid, the validator is silent and the
+        query proceeds."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            schema = Mock()
+            schema.json.return_value = {
+                "result": {"fields": [{"id": "case_status", "type": "text"}]}
+            }
+            schema.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "case_status": "Closed"}],
+                    "fields": [{"id": "case_status", "type": "text"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "filters": {"case_status": "Closed"},
+                },
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "Unknown field" not in text
+
+    @pytest.mark.asyncio
+    async def test_schema_fetch_failure_does_not_block_query(self, ckan_config):
+        """If we can't fetch the schema, the validator degrades silently
+        and the upstream call still happens (civic-AI #15)."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            # Schema fetch fails server-side
+            schema_fail = Mock()
+            schema_fail.json.return_value = {
+                "success": False,
+                "error": {"message": "schema unavailable"},
+            }
+            schema_fail.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "case_status": "Closed"}],
+                    "fields": [{"id": "case_status", "type": "text"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, schema_fail, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {
+                    "resource_id": "11111111-2222-3333-4444-555555555555",
+                    "filters": {"case_status": "Closed"},
+                },
+            )
+
+            # Despite schema failing, the actual query still ran
+            assert result.success is True
+
+
+class TestDateFieldNormalization:
+    """Civic-AI #7: timestamp/date columns render as ISO 8601."""
+
+    @pytest.fixture
+    def ckan_config(self):
+        return {
+            "base_url": "https://data.example.com",
+            "portal_url": "https://data.example.com",
+            "city_name": "TestCity",
+        }
+
+    @pytest.mark.asyncio
+    async def test_midnight_timestamp_renders_as_date_only(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "close_date": "2024-06-15T00:00:00"}],
+                    "fields": [
+                        {"id": "close_date", "type": "timestamp"},
+                    ],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "close_date: 2024-06-15" in text
+            # Midnight time-of-day must NOT be displayed
+            assert "T00:00:00" not in text
+
+    @pytest.mark.asyncio
+    async def test_non_midnight_timestamp_keeps_time_of_day(self, ckan_config):
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "ts": "2024-06-15T14:30:00"}],
+                    "fields": [{"id": "ts", "type": "timestamp"}],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "ts: 2024-06-15T14:30:00" in text
+
+    @pytest.mark.asyncio
+    async def test_non_date_columns_pass_through_unchanged(self, ckan_config):
+        """Text/int columns are never normalized."""
+        plugin = CKANPlugin(ckan_config)
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = AsyncMock()
+            init = Mock()
+            init.json.return_value = {"success": True}
+            init.raise_for_status = Mock()
+            query = Mock()
+            query.json.return_value = {
+                "result": {
+                    "records": [{"_id": 1, "name": "X", "count": 42}],
+                    "fields": [
+                        {"id": "name", "type": "text"},
+                        {"id": "count", "type": "int"},
+                    ],
+                    "total": 1,
+                }
+            }
+            query.raise_for_status = Mock()
+            mock_client.post = AsyncMock(side_effect=[init, query])
+            mock_client_class.return_value = mock_client
+
+            await plugin.initialize()
+            result = await plugin.execute_tool(
+                "query_data",
+                {"resource_id": "11111111-2222-3333-4444-555555555555"},
+            )
+
+            assert result.success is True
+            text = result.content[0]["text"]
+            assert "name: X" in text
+            assert "count: 42" in text
