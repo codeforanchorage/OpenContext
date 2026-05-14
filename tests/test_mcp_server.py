@@ -379,8 +379,8 @@ class TestUnknownMethods:
     """Test handling of unknown methods."""
 
     @pytest.mark.asyncio
-    async def test_unknown_method_raises_error(self):
-        """Test that unknown method raises ValueError."""
+    async def test_unknown_method_returns_method_not_found(self):
+        """Test that an unknown method returns JSON-RPC -32601 (Method not found)."""
         plugin_manager = MagicMock(spec=PluginManager)
         server = MCPServer(plugin_manager)
 
@@ -395,7 +395,8 @@ class TestUnknownMethods:
 
         assert response is not None
         assert "error" in response
-        assert response["error"]["code"] == -32603
+        assert response["error"]["code"] == -32601
+        assert response["error"]["message"] == "Method not found"
         assert "Unknown method" in response["error"]["data"]
 
 
