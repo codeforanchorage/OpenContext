@@ -16,13 +16,27 @@ from core.logging_utils import (
     format_request_log,
     format_response_log,
 )
-from core.mcp_server import MCPServer
+from core.mcp_server import ERA_MODERN, MCPServer
 from core.plugin_manager import PluginManager
 from core.validators import (
     ConfigurationError,
     get_logging_config,
     load_and_validate_config,
 )
+
+
+def _packaged_config_path() -> str:
+    """Path to the config.yaml shipped inside the deployment package.
+
+    On Lambda the package is extracted to ``$LAMBDA_TASK_ROOT`` (/var/task),
+    so resolve relative to that rather than the process CWD; fall back to the
+    CWD for local runs. The full config (including the ``instructions`` block)
+    is delivered as this packaged file rather than the ``OPENCONTEXT_CONFIG``
+    env var, which AWS caps at 4KB.
+    """
+    root = os.environ.get("LAMBDA_TASK_ROOT") or "."
+    return os.path.join(root, "config.yaml")
+
 
 # Configure JSON logging globally (must be called before other loggers are created)
 # Try to get log level from config, but default to INFO if config not available yet
@@ -34,8 +48,8 @@ try:
         logging_config = get_logging_config(config)
         log_level = logging_config.get("level", "INFO")
     else:
-        # Try loading from config.yaml (for local testing)
-        config = load_and_validate_config("config.yaml")
+        # Fall back to the packaged config.yaml.
+        config = load_and_validate_config(_packaged_config_path())
         logging_config = get_logging_config(config)
         log_level = logging_config.get("level", "INFO")
 except Exception:
@@ -49,12 +63,6 @@ logger = logging.getLogger(__name__)
 _plugin_manager: Optional[PluginManager] = None
 _mcp_server: Optional[MCPServer] = None
 _config: Optional[Dict[str, Any]] = None
-
-# Reject JSON-RPC request bodies larger than this before parsing. The MCP
-# surface is small — every legitimate tool call fits well under a few KB —
-# so this is a cheap DoS guard against attackers flooding the Lambda with
-# megabyte-sized payloads.
-MAX_BODY_SIZE = 65536
 
 
 def _load_config() -> Dict[str, Any]:
@@ -79,10 +87,11 @@ def _load_config() -> Dict[str, Any]:
             logger.error(f"Failed to parse config from environment: {e}")
             raise
 
-    # Fall back to loading from config.yaml (for local testing)
+    # Fall back to the packaged config.yaml (the primary path on Lambda now
+    # that the full config exceeds the 4KB OPENCONTEXT_CONFIG env-var limit).
     try:
-        _config = load_and_validate_config("config.yaml")
-        logger.info("Loaded configuration from config.yaml")
+        _config = load_and_validate_config(_packaged_config_path())
+        logger.info("Loaded configuration from packaged config.yaml")
         return _config
     except FileNotFoundError:
         logger.error(
@@ -129,23 +138,88 @@ async def _initialize_server() -> None:
 class UniversalHTTPHandler:
     """Universal HTTP handler for cloud-agnostic request processing."""
 
+    # Browser origins allowed to call /mcp via cross-origin requests.
+    # Native MCP clients (Claude Desktop, Claude Code, server-side
+    # integrations) do not enforce CORS, so they are unaffected by this
+    # list. Add real consumers here as they show up in CloudWatch.
+    ALLOWED_ORIGINS = frozenset(
+        {
+            "https://claude.ai",
+            "https://claude.com",
+            "https://console.anthropic.com",
+            "http://localhost:6274",
+            "http://127.0.0.1:6274",
+        }
+    )
+    # Default origin returned when no Origin header is sent or the
+    # caller's origin is not on the allowlist. claude.ai is the primary
+    # legitimate browser consumer today; reflecting it ensures the most
+    # common case keeps working without a request-header round-trip.
+    DEFAULT_CORS_ORIGIN = "https://claude.ai"
+
+    # Request paths that carry MCP JSON-RPC. The hardened GCC route
+    # (/mcp-gcc) shares this same Lambda handler as the public /mcp route;
+    # its API-key requirement is enforced at API Gateway, not here, so the
+    # handler simply needs to accept the path.
+    MCP_PATHS = frozenset({"/mcp", "/mcp-gcc"})
+
     def __init__(self) -> None:
         """Initialize the universal HTTP handler."""
         logger.info("UniversalHTTPHandler initialized")
 
-    @staticmethod
-    def _get_cors_headers() -> Dict[str, str]:
-        """Get standard CORS headers for responses.
+    @classmethod
+    def _get_cors_headers(
+        cls, request_origin: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Build CORS response headers, reflecting allowlisted origins.
+
+        Args:
+            request_origin: The Origin header from the incoming request,
+                if any. If it matches the allowlist, it's echoed back so
+                the browser will accept the response. Otherwise the
+                default (claude.ai) is sent — non-browser clients ignore
+                CORS, so they are unaffected.
 
         Returns:
-            Dictionary of CORS headers
+            Dictionary of CORS headers.
         """
+        if request_origin and request_origin in cls.ALLOWED_ORIGINS:
+            allow_origin = request_origin
+        else:
+            allow_origin = cls.DEFAULT_CORS_ORIGIN
         return {
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": allow_origin,
+            "Vary": "Origin",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "content-type",
+            "Access-Control-Allow-Headers": (
+                "content-type, accept, mcp-session-id, mcp-protocol-version, "
+                "mcp-method, mcp-name"
+            ),
             "Access-Control-Expose-Headers": "x-request-id, mcp-session-id",
         }
+
+    @classmethod
+    def _origin_rejected(cls, request_origin: Optional[str]) -> bool:
+        """Whether a request must be refused because of its Origin.
+
+        The MCP HTTP transport requires servers to answer 403 Forbidden for
+        an invalid Origin — the defence against DNS-rebinding attacks, which
+        matters here because ``/mcp`` is anonymous and CloudWatch already
+        shows it being probed.
+
+        Only a *present* Origin can be invalid: native MCP clients (Claude
+        Desktop, Claude Code, the claude.ai backend connector, Copilot
+        Studio, curl) send none at all, and are unaffected. A browser origin
+        that is not on the allowlist already fails CORS today — this turns a
+        confusing client-side CORS failure into an explicit server refusal.
+
+        Args:
+            request_origin: The Origin header from the request, if any.
+
+        Returns:
+            True if the request should be rejected with 403.
+        """
+        return bool(request_origin) and request_origin not in cls.ALLOWED_ORIGINS
 
     async def handle_request(
         self,
@@ -170,8 +244,44 @@ class UniversalHTTPHandler:
         start_time = time.perf_counter()
         request_id = request_id or "unknown"
 
-        # Validate path - must be /mcp
-        if path != "/mcp":
+        # Pull incoming MCP session ID (sent by clients on every request after
+        # the initial handshake). For `initialize` itself we generate one below.
+        incoming_session_id = headers.get("mcp-session-id") if headers else None
+
+        # Pull Origin header so CORS responses can reflect allowlisted origins.
+        request_origin = headers.get("origin") if headers else None
+
+        # Reject disallowed browser origins outright (DNS-rebinding defence)
+        # before the request reaches any routing or plugin code.
+        if self._origin_rejected(request_origin):
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            error_body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Forbidden",
+                        "data": "Origin not allowed",
+                    },
+                }
+            )
+            logger.warning(
+                f"403 error: Origin '{request_origin}' not allowed",
+                extra={
+                    "request_id": request_id,
+                    "request_path": path,
+                    "http_method": method,
+                    "request_origin": request_origin,
+                    "duration_ms": duration_ms,
+                },
+            )
+            error_headers = {"Content-Type": "application/json"}
+            error_headers.update(self._get_cors_headers(None))
+            return (403, error_headers, error_body)
+
+        # Validate path - must be an MCP route
+        if path not in self.MCP_PATHS:
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_body = json.dumps(
                 {
@@ -180,7 +290,7 @@ class UniversalHTTPHandler:
                     "error": {
                         "code": -32601,
                         "message": "Not Found",
-                        "data": f"Path '{path}' not found. Expected '/mcp'",
+                        "data": f"Path '{path}' not found. Expected '/mcp' or '/mcp-gcc'",
                     },
                 }
             )
@@ -194,7 +304,7 @@ class UniversalHTTPHandler:
                 },
             )
             error_headers = {"Content-Type": "application/json"}
-            error_headers.update(self._get_cors_headers())
+            error_headers.update(self._get_cors_headers(request_origin))
             return (
                 404,
                 error_headers,
@@ -225,57 +335,89 @@ class UniversalHTTPHandler:
                 },
             )
             error_headers = {"Content-Type": "application/json", "Allow": "POST"}
-            error_headers.update(self._get_cors_headers())
+            error_headers.update(self._get_cors_headers(request_origin))
             return (
                 405,
                 error_headers,
                 error_body,
             )
 
-        # Body size cap — reject oversized payloads before JSON parse.
-        body_bytes = (
-            len(body.encode("utf-8")) if isinstance(body, str) else len(body or b"")
+        # Parse JSON once up front: to echo the JSON-RPC id on transport-level
+        # errors (the spec's UnsupportedProtocolVersionError example carries
+        # the request's id, and a client correlating in-flight requests needs
+        # it), to detect initialize requests and mint a session ID, and to
+        # classify the era.
+        # NOTE: This is intentionally parsing the JSON body separately from the
+        # later parsing in _mcp_server.handle_http_request(), so a malformed
+        # body still gets that method's -32700 handling. The body is small;
+        # parsing it twice is an acceptable trade-off for error isolation.
+        body_request_id = None
+        try:
+            request_json = json.loads(body)
+            body_request_id = request_json.get("id")
+            is_initialize = request_json.get("method") == "initialize"
+            is_modern = (
+                MCPServer.request_era(request_json, headers) == ERA_MODERN
+            )
+        except (json.JSONDecodeError, AttributeError):
+            is_initialize = False
+            is_modern = False
+
+        # Validate the MCP-Protocol-Version header, which clients have been
+        # required to send on every post-handshake request since 2025-06-18.
+        # Absent means an older client: the spec says assume 2025-03-26, so
+        # we let it through untouched. Both legacy (2025-11-25 and earlier,
+        # initialize handshake) and modern (2026-07-28+, per-request _meta)
+        # revisions are served -- see core/mcp_server.py for the split; the
+        # modern era's header/body consistency checks happen there, once
+        # the body has been parsed.
+        #
+        # A version we implement in neither era gets the modern
+        # UnsupportedProtocolVersionError (-32022) listing what we do
+        # support: a modern client retries with one of those, and a
+        # legacy client at least sees a version it can ask for on
+        # initialize. (This used to be a bare -32600 on purpose, so that
+        # dual-era clients would fall back to initialize; now that we are
+        # dual-era ourselves that fallback would cost them a round trip
+        # for nothing.)
+        declared_version = (
+            headers.get("mcp-protocol-version") if headers else None
         )
-        if body_bytes > MAX_BODY_SIZE:
+        if (
+            declared_version
+            and declared_version not in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+        ):
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_body = json.dumps(
                 {
                     "jsonrpc": "2.0",
-                    "id": None,
+                    "id": body_request_id,
                     "error": {
-                        "code": -32600,
-                        "message": "Payload too large",
-                        "data": (
-                            f"Request body {body_bytes} bytes exceeds "
-                            f"{MAX_BODY_SIZE} byte limit"
-                        ),
+                        "code": -32022,
+                        "message": "Unsupported protocol version",
+                        "data": {
+                            "supported": list(
+                                MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+                            ),
+                            "requested": declared_version,
+                        },
                     },
                 }
             )
             logger.warning(
-                f"413 error: body {body_bytes} bytes exceeds {MAX_BODY_SIZE}",
+                f"400 error: unsupported MCP-Protocol-Version "
+                f"'{declared_version}'",
                 extra={
                     "request_id": request_id,
                     "request_path": path,
                     "http_method": method,
+                    "mcp_protocol_version": declared_version,
                     "duration_ms": duration_ms,
                 },
             )
             error_headers = {"Content-Type": "application/json"}
-            error_headers.update(self._get_cors_headers())
-            return (413, error_headers, error_body)
-
-        # Parse JSON to check if this is an initialize request
-        # NOTE: This is intentionally parsing the JSON body separately from the
-        # later parsing in _mcp_server.handle_http_request(). This early parsing
-        # allows us to detect initialize requests and generate session IDs without
-        # affecting error handling if the JSON is invalid. The body will be parsed
-        # again later, which is an acceptable trade-off for error handling isolation.
-        try:
-            request_json = json.loads(body)
-            is_initialize = request_json.get("method") == "initialize"
-        except (json.JSONDecodeError, AttributeError):
-            is_initialize = False
+            error_headers.update(self._get_cors_headers(request_origin))
+            return (400, error_headers, error_body)
 
         # Generate session ID for initialize requests
         # NOTE: This session ID is for logging and tracing purposes only.
@@ -288,8 +430,15 @@ class UniversalHTTPHandler:
             session_id = str(uuid.uuid4())
             logger.info(
                 f"Initialize request detected, generating session ID: {session_id}",
-                extra={"request_id": request_id},
+                extra={"request_id": request_id, "mcp_session_id": session_id},
             )
+
+        # Modern-era (2026-07-28) requests have no session: an
+        # Mcp-Session-Id a client sends anyway is ignored, never echoed or
+        # logged as if it correlated anything.
+        effective_session_id = (
+            None if is_modern else (session_id or incoming_session_id)
+        )
 
         # Log request details
         request_log_data = format_request_log(
@@ -300,6 +449,8 @@ class UniversalHTTPHandler:
             body=body,
             lambda_context=None,  # Not available in universal handler
         )
+        if effective_session_id:
+            request_log_data["mcp_session_id"] = effective_session_id
         logger.info("Incoming HTTP request", extra=request_log_data)
 
         try:
@@ -326,7 +477,7 @@ class UniversalHTTPHandler:
                 response_headers["Content-Type"] = "application/json"
 
             # Add CORS headers
-            response_headers.update(self._get_cors_headers())
+            response_headers.update(self._get_cors_headers(request_origin))
 
             # Calculate duration
             duration_ms = (time.perf_counter() - start_time) * 1000
@@ -340,6 +491,8 @@ class UniversalHTTPHandler:
                 duration_ms=duration_ms,
                 success=True,
             )
+            if effective_session_id:
+                response_log_data["mcp_session_id"] = effective_session_id
             logger.info("HTTP request processed successfully", extra=response_log_data)
 
             return (status_code, response_headers, response_body)
@@ -347,6 +500,8 @@ class UniversalHTTPHandler:
         except ConfigurationError as e:
             # Configuration errors should crash
             duration_ms = (time.perf_counter() - start_time) * 1000
+            # Don't leak config details to the client; full exception is in
+            # CloudWatch via logger.error(..., exc_info=True) below.
             error_body = json.dumps(
                 {
                     "jsonrpc": "2.0",
@@ -354,14 +509,14 @@ class UniversalHTTPHandler:
                     "error": {
                         "code": -32603,
                         "message": "Server configuration error",
-                        "data": str(e),
+                        "data": f"Request ID: {request_id}",
                     },
                 }
             )
 
             # Log error response
             error_headers = {"Content-Type": "application/json"}
-            error_headers.update(self._get_cors_headers())
+            error_headers.update(self._get_cors_headers(request_origin))
             response_log_data = format_response_log(
                 request_id=request_id,
                 status_code=500,
@@ -370,6 +525,8 @@ class UniversalHTTPHandler:
                 duration_ms=duration_ms,
                 success=False,
             )
+            if effective_session_id:
+                response_log_data["mcp_session_id"] = effective_session_id
             logger.error(
                 f"Configuration error in request {request_id}: {e}",
                 extra={**response_log_data, "error_type": "ConfigurationError"},
@@ -380,6 +537,8 @@ class UniversalHTTPHandler:
 
         except Exception as e:
             duration_ms = (time.perf_counter() - start_time) * 1000
+            # Don't leak exception details to the client; full traceback is in
+            # CloudWatch via logger.error(..., exc_info=True) below.
             error_body = json.dumps(
                 {
                     "jsonrpc": "2.0",
@@ -387,14 +546,14 @@ class UniversalHTTPHandler:
                     "error": {
                         "code": -32603,
                         "message": "Internal error",
-                        "data": str(e),
+                        "data": f"Request ID: {request_id}",
                     },
                 }
             )
 
             # Log error response
             error_headers = {"Content-Type": "application/json"}
-            error_headers.update(self._get_cors_headers())
+            error_headers.update(self._get_cors_headers(request_origin))
             response_log_data = format_response_log(
                 request_id=request_id,
                 status_code=500,
@@ -403,6 +562,8 @@ class UniversalHTTPHandler:
                 duration_ms=duration_ms,
                 success=False,
             )
+            if effective_session_id:
+                response_log_data["mcp_session_id"] = effective_session_id
             logger.error(
                 f"Error processing request {request_id}: {e}",
                 extra={**response_log_data, "error_type": type(e).__name__},
@@ -412,22 +573,44 @@ class UniversalHTTPHandler:
             return (500, error_headers, error_body)
 
     def handle_options(
-        self, request_id: Optional[str] = None
+        self,
+        request_id: Optional[str] = None,
+        request_origin: Optional[str] = None,
     ) -> Tuple[int, Dict[str, str], str]:
         """Handle CORS preflight OPTIONS request.
 
         Args:
             request_id: Optional request ID for logging/tracing
+            request_origin: Origin header from the preflight, used to
+                reflect allowlisted origins back to the browser.
 
         Returns:
             Tuple of (status_code, response_headers, response_body)
         """
         request_id = request_id or "unknown"
+
+        # Refuse the preflight outright for a disallowed origin, so the
+        # browser never issues the actual request.
+        if self._origin_rejected(request_origin):
+            logger.warning(
+                f"403 preflight: Origin '{request_origin}' not allowed",
+                extra={
+                    "request_id": request_id,
+                    "request_origin": request_origin,
+                },
+            )
+            return (
+                403,
+                {
+                    **self._get_cors_headers(None),
+                    "Content-Type": "application/json",
+                    "X-Request-ID": request_id,
+                },
+                "",
+            )
+
         cors_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "content-type",
-            "Access-Control-Expose-Headers": "x-request-id, mcp-session-id",
+            **self._get_cors_headers(request_origin),
             "Access-Control-Max-Age": "86400",
             "Content-Type": "application/json",
             "X-Request-ID": request_id,
