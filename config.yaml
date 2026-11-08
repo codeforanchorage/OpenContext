@@ -9,7 +9,7 @@ plugins:
     base_url: "https://data.boston.gov/"
     portal_url: "https://data.boston.gov/"
     city_name: "Boston"
-    timeout: 120
+    timeout: 20
 
   arcgis:
     enabled: false
@@ -21,7 +21,7 @@ aws:
   region: "us-west-2"
   lambda_name: "boston-ckan-mcp-staging"
   lambda_memory: 512
-  lambda_timeout: 120
+  lambda_timeout: 28
 
 logging:
   level: "INFO"
