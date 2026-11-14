@@ -270,20 +270,35 @@ else
     # version. Without these flags pip picks wheels for the ambient interpreter
     # (e.g. cp314 on a Python 3.14 build host), which then fail to import at
     # Lambda cold start with a 502 InternalServerErrorException.
-    # opencontext-core is the one exception to --only-binary: it is pure
-    # Python installed from a git tag, so pip has to build it.
-    if ! pip install -r requirements.txt \
+    #
+    # opencontext-core cannot go through that install: it comes from a git
+    # tag, so pip has to BUILD it, and pip refuses to build anything while
+    # --platform/--python-version are set. It is pure Python, so it is
+    # installed in a second step with no platform flags and --no-deps;
+    # its own dependencies (pydantic, PyYAML, python-json-logger) are in
+    # requirements.txt and arrive, as cp311 wheels, with the first step.
+    BINARY_REQS="$PACKAGE_DIR/.requirements-binary.txt"
+    CORE_REQ=$(grep -E '^opencontext-core[ @]' requirements.txt | tr -d '\r' || true)
+    grep -vE '^opencontext-core[ @]' requirements.txt > "$BINARY_REQS"
+    if ! pip install -r "$BINARY_REQS" \
         -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
         --python-version 3.11 \
         --implementation cp \
         --abi cp311 \
         --only-binary :all: \
-        --no-binary opencontext-core \
         --no-compile; then
         echo -e "${RED}❌ Error: Failed to install dependencies for python3.11${NC}"
         echo "Ensure pip >= 22 is available and every requirement has a cp311 manylinux wheel."
         exit 1
+    fi
+    rm -f "$BINARY_REQS"
+    if [ -n "$CORE_REQ" ]; then
+        if ! pip install "$CORE_REQ" -t "$PACKAGE_DIR/" \
+            --no-deps --no-compile; then
+            echo -e "${RED}Error: Failed to install opencontext-core${NC}"
+            exit 1
+        fi
     fi
 fi
 
