@@ -27,17 +27,32 @@ def test_core_and_lambda_handler_import():
     assert callable(lambda_handler)
 
 
-def test_core_discovers_this_repos_enabled_plugin(monkeypatch):
+def test_core_discovers_this_repos_plugins(monkeypatch):
+    """The installed core must find the plugins in THIS repo. config.yaml
+    is gitignored here (CI has none), so the check is against the plugin
+    directories themselves, plus the enabled plugin when a config exists."""
     from core.plugin_manager import PluginManager
     from core.validators import get_enabled_plugin_config
 
     monkeypatch.chdir(REPO_ROOT)
-    config = yaml.safe_load((REPO_ROOT / "config.yaml").read_text("utf-8"))
-    enabled, _ = get_enabled_plugin_config(config)
-    discovered = dict(PluginManager(config).discover_plugins())
+    on_disk = {
+        path.parent.name
+        for path in (REPO_ROOT / "plugins").glob("*/plugin.py")
+        if not path.parent.name.startswith("_")
+    }
+    discovered = dict(
+        PluginManager({"plugins": {}}).discover_plugins()
+    )
 
-    assert enabled in discovered
-    assert discovered[enabled].parent == REPO_ROOT / "plugins"
+    assert on_disk and on_disk <= set(discovered)
+    for name in on_disk:
+        assert discovered[name].parent == REPO_ROOT / "plugins"
+
+    config_path = REPO_ROOT / "config.yaml"
+    if config_path.exists():
+        config = yaml.safe_load(config_path.read_text("utf-8"))
+        enabled, _ = get_enabled_plugin_config(config)
+        assert enabled in discovered
 
 
 def test_core_pin_is_the_same_everywhere():
