@@ -242,11 +242,11 @@ PACKAGE_DIR=".deploy"
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR"
 
-# Copy code to package directory
-cp -r core "$PACKAGE_DIR/"
+# Copy this deployment's code to the package directory. core/ and server/
+# are NOT copied: they come from the opencontext-core requirement, which the
+# install step below places next to plugins/ in the package root.
 cp -r plugins "$PACKAGE_DIR/"
 cp -r custom_plugins "$PACKAGE_DIR/" 2>/dev/null || mkdir -p "$PACKAGE_DIR/custom_plugins"
-cp -r server "$PACKAGE_DIR/"
 cp requirements.txt "$PACKAGE_DIR/" 2>/dev/null || true
 
 # Install Python dependencies into package directory
@@ -270,6 +270,8 @@ else
     # version. Without these flags pip picks wheels for the ambient interpreter
     # (e.g. cp314 on a Python 3.14 build host), which then fail to import at
     # Lambda cold start with a 502 InternalServerErrorException.
+    # opencontext-core is the one exception to --only-binary: it is pure
+    # Python installed from a git tag, so pip has to build it.
     if ! pip install -r requirements.txt \
         -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
@@ -277,12 +279,22 @@ else
         --implementation cp \
         --abi cp311 \
         --only-binary :all: \
+        --no-binary opencontext-core \
         --no-compile; then
         echo -e "${RED}❌ Error: Failed to install dependencies for python3.11${NC}"
         echo "Ensure pip >= 22 is available and every requirement has a cp311 manylinux wheel."
         exit 1
     fi
 fi
+
+# The handler string is server.adapters.aws_lambda.lambda_handler, so a
+# package without these files is a Lambda that cannot start.
+for required in core/mcp_server.py server/adapters/aws_lambda.py; do
+    if [ ! -f "$PACKAGE_DIR/$required" ]; then
+        echo -e "${RED}Error: $required is missing from the package. Is opencontext-core in requirements.txt?${NC}"
+        exit 1
+    fi
+done
 
 # Create zip file using Python's stdlib zipfile — matches the convention in
 # .github/workflows/infra.yml and avoids depending on the `zip` binary, which

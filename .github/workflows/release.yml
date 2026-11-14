@@ -125,9 +125,11 @@ jobs:
 
       - name: Copy application code into package
         run: |
-          cp -r server/ package/server/
+          # core/ and server/ are not copied: the opencontext-core
+          # requirement installed above already put them in ./package.
           cp -r plugins/ package/plugins/
-          cp -r core/ package/core/
+          test -f package/core/mcp_server.py
+          test -f package/server/adapters/aws_lambda.py
           cp examples/boston-opendata/config.yaml package/config.yaml
 
       - name: Create Lambda ZIP

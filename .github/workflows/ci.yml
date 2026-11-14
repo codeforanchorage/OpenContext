@@ -35,7 +35,7 @@ jobs:
         run: uv sync --all-extras
 
       - name: Ruff lint
-        run: uv run ruff check core/ plugins/ server/ tests/
+        run: uv run ruff check plugins/ tests/
 
       - name: Audit dependencies for known CVEs
         run: uv run pip-audit -r requirements.txt
@@ -81,7 +81,6 @@ jobs:
         run: |
           uv run pytest tests/ \
             -n auto \
-            --cov=core \
             --cov=plugins \
             --cov-report=term-missing \
             --cov-fail-under=80

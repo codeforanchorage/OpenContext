@@ -14,15 +14,19 @@ OpenContext is a plugin-based framework. Each deployment runs **one** server wit
 
 ## Components
 
+`core/` and `server/` are not in this repo: they are the
+[`opencontext-core`](https://github.com/codeforanchorage/opencontext-core)
+package, pinned in `requirements.txt`. Everything else below is.
+
 ```
-core/
+core/                   # from opencontext-core
 ├── interfaces.py       # MCPPlugin, DataPlugin, ToolDefinition
 ├── plugin_manager.py   # Discovery, loading, routing
 ├── mcp_server.py       # MCP JSON-RPC handler
 ├── validators.py       # Config validation
 └── logging_utils.py   # Structured logging
 
-server/
+server/                 # from opencontext-core
 ├── adapters/
 │   └── aws_lambda.py   # Lambda handler entry point
 └── http_handler.py     # HTTP request handling
