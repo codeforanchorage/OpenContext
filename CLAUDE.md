@@ -19,7 +19,7 @@ python3 -c "from core.validators import load_and_validate_config; load_and_valid
 uv run pytest tests/ -n auto                                    # All tests, parallel
 uv run pytest tests/test_ckan_plugin.py -v                      # Single file
 uv run pytest tests/test_ckan_plugin.py::TestClass::test_name -v  # Single test
-uv run pytest tests/ --cov=plugins --cov-report=term-missing  # With coverage (80% minimum)
+uv run pytest tests/ --cov=plugins --cov-report=term-missing  # With coverage (75% minimum, plugins only)
 
 # Linting (ruff)
 uv run ruff check plugins/ tests/      # Check
