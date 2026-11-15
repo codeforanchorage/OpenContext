@@ -258,15 +258,15 @@ if command -v uv &> /dev/null; then
     if ! uv pip install -r requirements.txt \
         --target "$PACKAGE_DIR/" \
         --python-platform x86_64-manylinux2014 \
-        --python-version 3.11 \
+        --python-version 3.14 \
         --no-compile; then
         echo -e "${RED}❌ Error: Failed to install dependencies with uv${NC}"
         exit 1
     fi
 else
     echo "uv not found, falling back to pip..."
-    # Lambda runtime is pinned to python3.11 in terraform/aws/main.tf, so we
-    # must force pip to resolve cp311 wheels regardless of the host Python
+    # Lambda runtime is pinned to python3.14 in terraform/aws/main.tf, so we
+    # must force pip to resolve cp314 wheels regardless of the host Python
     # version. Without these flags pip picks wheels for the ambient interpreter
     # (e.g. cp314 on a Python 3.14 build host), which then fail to import at
     # Lambda cold start with a 502 InternalServerErrorException.
@@ -276,20 +276,20 @@ else
     # --platform/--python-version are set. It is pure Python, so it is
     # installed in a second step with no platform flags and --no-deps;
     # its own dependencies (pydantic, PyYAML, python-json-logger) are in
-    # requirements.txt and arrive, as cp311 wheels, with the first step.
+    # requirements.txt and arrive, as cp314 wheels, with the first step.
     BINARY_REQS="$PACKAGE_DIR/.requirements-binary.txt"
     CORE_REQ=$(grep -E '^opencontext-core[ @]' requirements.txt | tr -d '\r' || true)
     grep -vE '^opencontext-core[ @]' requirements.txt > "$BINARY_REQS"
     if ! pip install -r "$BINARY_REQS" \
         -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
-        --python-version 3.11 \
+        --python-version 3.14 \
         --implementation cp \
-        --abi cp311 \
+        --abi cp314 \
         --only-binary :all: \
         --no-compile; then
-        echo -e "${RED}❌ Error: Failed to install dependencies for python3.11${NC}"
-        echo "Ensure pip >= 22 is available and every requirement has a cp311 manylinux wheel."
+        echo -e "${RED}❌ Error: Failed to install dependencies for python3.14${NC}"
+        echo "Ensure pip >= 22 is available and every requirement has a cp314 manylinux wheel."
         exit 1
     fi
     rm -f "$BINARY_REQS"

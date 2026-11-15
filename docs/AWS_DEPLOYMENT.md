@@ -77,13 +77,13 @@ Prod now fronts the API Gateway with an ACM cert and the custom domain `boston-d
 Both `scripts/deploy.sh` and `.github/workflows/release.yml` were updated so the Lambda ZIP matches the runtime regardless of the build host.
 
 - Detects `python3` or falls back to `python` (Windows build hosts).
-- Forces cp311 manylinux wheels on every dependency install:
+- Forces cp314 manylinux wheels on every dependency install:
   ```bash
   pip install -r requirements.txt -t ./package \
       --platform manylinux2014_x86_64 \
       --python-version 3.11 \
       --implementation cp \
-      --abi cp311 \
+      --abi cp314 \
       --only-binary :all: \
       --no-compile
   ```
@@ -128,7 +128,7 @@ terraform init
 
 ### 2.2 Deploying changes
 
-The deploy script validates `config.yaml`, builds a cp311/manylinux Lambda ZIP, and runs `terraform apply`:
+The deploy script validates `config.yaml`, builds a cp314/manylinux Lambda ZIP, and runs `terraform apply`:
 
 ```bash
 # Staging
@@ -141,7 +141,7 @@ The deploy script validates `config.yaml`, builds a cp311/manylinux Lambda ZIP, 
 Under the hood:
 
 1. Counts enabled plugins (must be exactly one — enforced by `core/validators.py`).
-2. Builds `lambda-deployment.zip` with dependencies forced to cp311 manylinux wheels.
+2. Builds `lambda-deployment.zip` with dependencies forced to cp314 manylinux wheels.
 3. `terraform apply -var-file=<env>.tfvars` against `terraform/aws/`.
 
 ### 2.3 Environment configuration
