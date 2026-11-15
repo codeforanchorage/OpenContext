@@ -81,7 +81,7 @@ Both `scripts/deploy.sh` and `.github/workflows/release.yml` were updated so the
   ```bash
   pip install -r requirements.txt -t ./package \
       --platform manylinux2014_x86_64 \
-      --python-version 3.11 \
+      --python-version 3.14 \
       --implementation cp \
       --abi cp314 \
       --only-binary :all: \
