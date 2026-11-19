@@ -120,11 +120,21 @@ resource "aws_api_gateway_deployment" "mcp_deployment" {
 
   triggers = {
     redeployment = sha1(jsonencode([
-      aws_api_gateway_resource.mcp.id,
-      aws_api_gateway_method.mcp_post.id,
-      aws_api_gateway_method.mcp_options.id,
-      aws_api_gateway_integration.mcp_post_integration.id,
-      aws_api_gateway_integration.mcp_options_integration.id,
+      # Whole objects, not ids: this hashes the CONFIGURATION. An in-place
+      # change (api_key_required, authorization, an integration's timeout
+      # or type, a response) keeps the same id, so an id-only trigger did
+      # not redeploy and the stage went on serving the old settings.
+      aws_api_gateway_resource.mcp,
+      aws_api_gateway_method.mcp_post,
+      aws_api_gateway_method.mcp_options,
+      aws_api_gateway_integration.mcp_post_integration,
+      aws_api_gateway_integration.mcp_options_integration,
+      # Responses are part of the deployed snapshot too.
+      aws_api_gateway_method_response.mcp_post_response_200,
+      aws_api_gateway_method_response.mcp_options_response_200,
+      aws_api_gateway_integration_response.mcp_options_integration_response,
+      # Lambda ARN: a Lambda rename updates the integration URI in place.
+      aws_lambda_function.mcp_server.arn,
     ]))
   }
 
